@@ -25,7 +25,15 @@ if (Test-Path -LiteralPath $Destination) {
     Write-Host "Backed up source to: $backup"
 }
 
-Copy-Item -LiteralPath $Source -Destination $Destination -Force
+$sourceFull = [System.IO.Path]::GetFullPath($Source)
+$destinationFull = [System.IO.Path]::GetFullPath($Destination)
+
+if (-not $sourceFull.Equals($destinationFull, [System.StringComparison]::OrdinalIgnoreCase)) {
+    Copy-Item -LiteralPath $Source -Destination $Destination -Force
+}
+else {
+    Write-Host "Updated source is already the canonical source; skipping self-copy."
+}
 
 # Remove Mark of the Web from existing user-specific launcher data.
 # This is intentionally scoped to Groups and Pin to Taskbar.
