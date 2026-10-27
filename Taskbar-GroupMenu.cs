@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
@@ -11,12 +11,15 @@ using System.Windows.Forms;
 
 internal static class Program
 {
-    private const string Root = @"C:\code\_Scripts\Taskbar-Groups";
-    private static readonly string GroupsRoot = Path.Combine(Root, "Groups");
-    private static readonly string TemplatesRoot = Path.Combine(Root, "_templates");
-    private static readonly string PinRoot = Path.Combine(Root, "Pin to Taskbar");
-    private static readonly string IconRoot = Path.Combine(Root, "Icon Library");
-    private static readonly string ExePath = Path.Combine(Root, "Taskbar-GroupMenu.exe");
+    private static readonly string AppRoot = Application.StartupPath;
+    private static readonly string DataRoot = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+        "Taskbar-Groups");
+    private static readonly string GroupsRoot = Path.Combine(DataRoot, "Groups");
+    private static readonly string PinRoot = Path.Combine(DataRoot, "Pin to Taskbar");
+    private static readonly string TemplatesRoot = Path.Combine(AppRoot, "_templates");
+    private static readonly string IconRoot = Path.Combine(AppRoot, "Icon Library");
+    private static readonly string ExePath = Path.Combine(AppRoot, "Taskbar-GroupMenu.exe");
 
     private static string Group;
     private static string GroupFolder;
@@ -24,6 +27,17 @@ internal static class Program
     private static Form HostForm;
     private static Point MenuPoint;
     private static bool RefreshRequested;
+    private static bool PreserveMenuPoint;
+    private static Point ExactRestorePoint;
+    private static bool UseExactRestorePoint;
+    private static Point LastMainMenuLocation;
+    private static bool HaveLastMainMenuLocation;
+    private static bool KeepHostAliveForCommand;
+    private static ToolStripItem DragCandidate;
+    private static Point DragStartScreen;
+    private static bool ReorderDragging;
+    private static int DragInsertionIndex = -1;
+    private static bool SuppressNextLaunch;
 
     private static readonly string[] AllowedExtensions =
     {
@@ -42,6 +56,10 @@ internal static class Program
                 MessageBoxButtons.OK, MessageBoxIcon.Error);
             return;
         }
+
+        Directory.CreateDirectory(DataRoot);
+        Directory.CreateDirectory(GroupsRoot);
+        Directory.CreateDirectory(PinRoot);
 
         Group = args[0];
         GroupFolder = Path.Combine(GroupsRoot, Group);
@@ -80,6 +98,9 @@ internal static class Program
         };
 
         ApplyTheme(MainMenu);
+        MainMenu.Paint += MainMenuPaint;
+        MainMenu.MouseMove += ReorderMouseMove;
+        MainMenu.MouseUp += ReorderMouseUp;
 
         List<FileInfo> files = GetGroupItems();
 
@@ -101,7 +122,30 @@ internal static class Program
         var openFolder = new ToolStripMenuItem("Open " + Group + " folder");
         openFolder.Click += delegate
         {
-            Process.Start("explorer.exe", Quote(GroupFolder));
+            string folderToOpen = GroupFolder;
+
+            // Explorer needs to be launched only after our popup and hidden host
+            // have actually finished closing. A foreground worker thread keeps
+            // this tiny launcher process alive long enough to do that without
+            // leaving our WinForms window present while Groupy attaches Explorer.
+            System.Threading.Thread opener = new System.Threading.Thread(
+                delegate()
+                {
+                    System.Threading.Thread.Sleep(200);
+
+                    // Ask the Windows shell to open the folder rather than launching
+                    // explorer.exe directly. Modern Explorer may create a transient
+                    // process/window and hand the request to the existing shell, which
+                    // produces a visible flash.
+                    Process.Start(new ProcessStartInfo
+                    {
+                        FileName = folderToOpen,
+                        UseShellExecute = true
+                    });
+                });
+            opener.IsBackground = false;
+            opener.Start();
+
             CloseMenu(false);
         };
         MainMenu.Items.Add(openFolder);
@@ -115,15 +159,53 @@ internal static class Program
         options.DropDownItems.Add(MakeItem("Change Group Icon", delegate { ChangeGroupIcon(); }));
         options.DropDownItems.Add(MakeItem("New Group", delegate { NewGroup(); }));
         options.DropDownItems.Add(MakeItem("Delete Group", delegate { DeleteGroup(); }));
+
+        // This fires before WinForms closes the owning ContextMenuStrip.
+        // Keep the hidden host alive while a command is running so modal
+        // dialogs (Add Link, New Group, Rename, icon pickers, etc.) survive.
+        options.DropDown.ItemClicked += delegate
+        {
+            KeepHostAliveForCommand = true;
+        };
+
+        ApplyTheme(options.DropDown);
+        if (IsDarkMode())
+        {
+            foreach (ToolStripItem child in options.DropDownItems)
+                if (!(child is ToolStripSeparator))
+                    child.ForeColor = Color.FromArgb(240, 240, 240);
+        }
+
         MainMenu.Items.Add(options);
 
         MenuPoint = Cursor.Position;
-        HostForm.Location = MenuPoint;
+        HostForm.Location = UseExactRestorePoint ? ExactRestorePoint : MenuPoint;
         HostForm.Show();
         HostForm.Activate();
 
-        MainMenu.Closed += delegate { HostForm.Close(); };
-        MainMenu.Show(MenuPoint);
+        MainMenu.Closed += delegate
+        {
+            if (!KeepHostAliveForCommand)
+                HostForm.Close();
+        };
+        if (UseExactRestorePoint)
+        {
+            MainMenu.Show(new Point(0, 0));
+            MainMenu.Location = ExactRestorePoint;
+            UseExactRestorePoint = false;
+            PreserveMenuPoint = false;
+        }
+        else
+        {
+            MainMenu.Show(MenuPoint);
+        }
+
+        // Persist the actual top-left while the menu is definitely still open.
+        // Submenu commands close MainMenu before their Click handlers run, so
+        // RefreshMenu() cannot reliably query MainMenu.Location later.
+        LastMainMenuLocation = MainMenu.Location;
+        HaveLastMainMenuLocation = true;
+
         Application.Run(HostForm);
 
         MainMenu.Dispose();
@@ -136,8 +218,13 @@ internal static class Program
 
         if (ext == ".separator")
         {
-            var sep = new ToolStripSeparator { Tag = file.FullName };
-            sep.MouseDown += ItemMouseDown;
+            var sep = new ToolStripSeparator
+            {
+                Tag = file.FullName,
+                AutoSize = false,
+                Height = 13
+            };
+            WireReorderHandlers(sep);
             MainMenu.Items.Add(sep);
             return;
         }
@@ -151,10 +238,13 @@ internal static class Program
         if (ext == ".heading")
         {
             item.Font = new Font(item.Font, FontStyle.Bold);
-            item.ForeColor = IsDarkMode() ? Color.FromArgb(175, 175, 175) : Color.FromArgb(90, 90, 90);
-            item.Click += delegate { };
+            item.ForeColor = IsDarkMode() ? Color.FromArgb(245, 245, 245) : Color.FromArgb(45, 45, 45);
+            item.BackColor = IsDarkMode() ? Color.FromArgb(58, 58, 58) : Color.FromArgb(218, 218, 218);
         }
-        else
+
+        WireReorderHandlers(item);
+
+        if (ext != ".heading")
         {
             try
             {
@@ -163,8 +253,18 @@ internal static class Program
             }
             catch { }
 
-            item.Click += delegate
+            // ToolStripMenuItem.Click is not reliably left-button-only.
+            // Launch explicitly from MouseUp so a right-click can only open
+            // the management submenu and can never launch the item.
+            item.MouseUp += delegate(object sender, MouseEventArgs e)
             {
+                if (e.Button != MouseButtons.Left) return;
+                if (SuppressNextLaunch)
+                {
+                    SuppressNextLaunch = false;
+                    return;
+                }
+
                 try { Launch(file.FullName); }
                 catch (Exception ex)
                 {
@@ -175,45 +275,238 @@ internal static class Program
             };
         }
 
-        item.MouseDown += ItemMouseDown;
         MainMenu.Items.Add(item);
+    }
+
+    private static void WireReorderHandlers(ToolStripItem item)
+    {
+        item.MouseDown += ItemMouseDown;
+        item.MouseMove += ReorderMouseMove;
+        item.MouseUp += ReorderMouseUp;
+    }
+
+    private static void ReorderMouseMove(object sender, MouseEventArgs e)
+    {
+        if (DragCandidate == null || Control.MouseButtons != MouseButtons.Left) return;
+
+        Point now = Control.MousePosition;
+        if (!ReorderDragging)
+        {
+            Size threshold = SystemInformation.DragSize;
+            if (Math.Abs(now.X - DragStartScreen.X) < threshold.Width / 2 &&
+                Math.Abs(now.Y - DragStartScreen.Y) < threshold.Height / 2)
+                return;
+
+            ReorderDragging = true;
+            MainMenu.Capture = true;
+        }
+
+        DragInsertionIndex = GetDropInsertionIndex(now);
+        MainMenu.Invalidate();
+    }
+
+    private static void ReorderMouseUp(object sender, MouseEventArgs e)
+    {
+        if (e.Button != MouseButtons.Left || DragCandidate == null) return;
+
+        ToolStripItem source = DragCandidate;
+        bool wasDragging = ReorderDragging;
+        int insertion = DragInsertionIndex;
+
+        DragCandidate = null;
+        ReorderDragging = false;
+        DragInsertionIndex = -1;
+        MainMenu.Capture = false;
+        MainMenu.Invalidate();
+
+        if (!wasDragging) return;
+
+        SuppressNextLaunch = true;
+        ReorderByDrop(source, insertion);
+    }
+
+    private static int GetDropInsertionIndex(Point screenPoint)
+    {
+        List<FileInfo> files = GetGroupItems();
+        Point client = MainMenu.PointToClient(screenPoint);
+
+        for (int i = 0; i < files.Count; i++)
+        {
+            ToolStripItem visual = FindMenuItemByPath(files[i].FullName);
+            if (visual == null) continue;
+            int midpoint = visual.Bounds.Top + visual.Bounds.Height / 2;
+            if (client.Y < midpoint) return i;
+        }
+
+        return files.Count;
+    }
+
+    private static void ReorderByDrop(ToolStripItem source, int insertion)
+    {
+        if (source == null || source.Tag == null || insertion < 0) return;
+
+        string sourcePath = source.Tag.ToString();
+        List<FileInfo> ordered = GetGroupItems();
+        int oldIndex = ordered.FindIndex(delegate(FileInfo f) { return SamePath(f.FullName, sourcePath); });
+        if (oldIndex < 0) return;
+
+        FileInfo moving = ordered[oldIndex];
+        ordered.RemoveAt(oldIndex);
+        if (insertion > oldIndex) insertion--;
+        if (insertion < 0) insertion = 0;
+        if (insertion > ordered.Count) insertion = ordered.Count;
+        if (insertion == oldIndex) return;
+
+        ordered.Insert(insertion, moving);
+
+        try
+        {
+            RenumberInOrder(ordered);
+            RefreshMenu();
+        }
+        catch (Exception ex)
+        {
+            Error("Could not reorder item.", ex);
+        }
+    }
+
+    private static ToolStripItem FindMenuItemByPath(string path)
+    {
+        foreach (ToolStripItem item in MainMenu.Items)
+            if (item.Tag != null && SamePath(item.Tag.ToString(), path))
+                return item;
+        return null;
+    }
+
+    private static void RenumberInOrder(List<FileInfo> ordered)
+    {
+        var temporary = new List<string>();
+
+        for (int i = 0; i < ordered.Count; i++)
+        {
+            string tempPath = Path.Combine(GroupFolder,
+                "__reorder_" + Guid.NewGuid().ToString("N") + ordered[i].Extension);
+            File.Move(ordered[i].FullName, tempPath);
+            temporary.Add(tempPath);
+        }
+
+        for (int i = 0; i < ordered.Count; i++)
+        {
+            string cleanName = StripNumericPrefix(Path.GetFileNameWithoutExtension(ordered[i].Name));
+            string finalPath = Path.Combine(GroupFolder,
+                PrefixName((i + 1) * 10, cleanName, ordered[i].Extension));
+            File.Move(temporary[i], finalPath);
+        }
+    }
+
+    private static void MainMenuPaint(object sender, PaintEventArgs e)
+    {
+        if (MainMenu == null) return;
+
+        Color separatorBand = IsDarkMode() ? Color.FromArgb(48, 48, 48) : Color.FromArgb(232, 232, 232);
+        Color separatorLine = IsDarkMode() ? Color.FromArgb(112, 112, 112) : Color.FromArgb(150, 150, 150);
+
+        foreach (ToolStripItem item in MainMenu.Items)
+        {
+            if (item.Tag == null) continue;
+            string path = item.Tag.ToString();
+            if (!Path.GetExtension(path).Equals(".separator", StringComparison.OrdinalIgnoreCase)) continue;
+
+            Rectangle band = new Rectangle(1, item.Bounds.Top, Math.Max(1, MainMenu.ClientSize.Width - 2), item.Bounds.Height);
+            using (Brush b = new SolidBrush(separatorBand)) e.Graphics.FillRectangle(b, band);
+            int y = item.Bounds.Top + item.Bounds.Height / 2;
+            using (Pen p = new Pen(separatorLine))
+                e.Graphics.DrawLine(p, 8, y, Math.Max(8, MainMenu.ClientSize.Width - 9), y);
+        }
+
+        if (ReorderDragging && DragInsertionIndex >= 0)
+        {
+            List<FileInfo> files = GetGroupItems();
+            int y;
+            if (DragInsertionIndex >= files.Count)
+            {
+                ToolStripItem last = files.Count == 0 ? null : FindMenuItemByPath(files[files.Count - 1].FullName);
+                y = last == null ? 2 : last.Bounds.Bottom;
+            }
+            else
+            {
+                ToolStripItem target = FindMenuItemByPath(files[DragInsertionIndex].FullName);
+                y = target == null ? 2 : target.Bounds.Top;
+            }
+
+            Color marker = IsDarkMode() ? Color.FromArgb(235, 235, 235) : Color.FromArgb(45, 45, 45);
+            using (Pen p = new Pen(marker, 2))
+                e.Graphics.DrawLine(p, 3, y, Math.Max(3, MainMenu.ClientSize.Width - 4), y);
+        }
     }
 
     private static void ItemMouseDown(object sender, MouseEventArgs e)
     {
-        if (e.Button != MouseButtons.Right) return;
-
         ToolStripItem tsi = sender as ToolStripItem;
         if (tsi == null || tsi.Tag == null) return;
+
+        if (e.Button == MouseButtons.Left)
+        {
+            DragCandidate = tsi;
+            DragStartScreen = Control.MousePosition;
+            ReorderDragging = false;
+            DragInsertionIndex = -1;
+            SuppressNextLaunch = false;
+            return;
+        }
+
+        if (e.Button != MouseButtons.Right) return;
 
         string path = tsi.Tag.ToString();
         if (!File.Exists(path)) return;
 
-        ShowItemContext(path);
+        ToolStripMenuItem menuItem = tsi as ToolStripMenuItem;
+        if (menuItem != null)
+        {
+            ShowItemContext(path, menuItem);
+            return;
+        }
+
+        // ToolStripSeparator cannot own a submenu. For separators, use the
+        // same management commands through Group Options instead of opening
+        // a second top-level ContextMenuStrip, which would close MainMenu.
     }
 
-    private static void ShowItemContext(string path)
+    private static void ShowItemContext(string path, ToolStripMenuItem ownerItem)
     {
-        var menu = new ContextMenuStrip();
-        ApplyTheme(menu);
+        if (MainMenu != null && MainMenu.Visible)
+        {
+            LastMainMenuLocation = MainMenu.Location;
+            HaveLastMainMenuLocation = true;
+        }
 
-        menu.Items.Add(MakeItem("Move Up", delegate { MoveItem(path, -1); }));
-        menu.Items.Add(MakeItem("Move Down", delegate { MoveItem(path, +1); }));
-        menu.Items.Add(new ToolStripSeparator());
+        ownerItem.DropDownItems.Clear();
 
-        menu.Items.Add(MakeItem("Insert Header Above", delegate { InsertTemplate(path, true, true); }));
-        menu.Items.Add(MakeItem("Insert Separator Below", delegate { InsertTemplate(path, false, true); }));
-        menu.Items.Add(new ToolStripSeparator());
+        ownerItem.DropDown.ItemClicked += delegate
+        {
+            KeepHostAliveForCommand = true;
+        };
 
-        menu.Items.Add(MakeItem("Add Link Below", delegate { AddLink(path, true); }));
-        menu.Items.Add(MakeItem("Rename", delegate { RenameItem(path); }));
+        ApplyTheme(ownerItem.DropDown);
+        ToolStripItemCollection items = ownerItem.DropDownItems;
+
+        items.Add(MakeItem("Move Up", delegate { MoveItem(path, -1); }));
+        items.Add(MakeItem("Move Down", delegate { MoveItem(path, +1); }));
+        items.Add(new ToolStripSeparator());
+
+        items.Add(MakeItem("Insert Header Above", delegate { InsertTemplate(path, true, true); }));
+        items.Add(MakeItem("Insert Separator Below", delegate { InsertTemplate(path, false, true); }));
+        items.Add(new ToolStripSeparator());
+
+        items.Add(MakeItem("Add Link Below", delegate { AddLink(path, true); }));
+        items.Add(MakeItem("Rename", delegate { RenameItem(path); }));
 
         var changeIcon = MakeItem("Change Icon", delegate { ChangeItemIcon(path); });
         changeIcon.Enabled = Path.GetExtension(path).Equals(".lnk", StringComparison.OrdinalIgnoreCase);
-        menu.Items.Add(changeIcon);
+        items.Add(changeIcon);
 
-        menu.Items.Add(MakeItem("Remove", delegate { RemoveItem(path); }));
-        menu.Items.Add(new ToolStripSeparator());
+        items.Add(MakeItem("Remove", delegate { RemoveItem(path); }));
+        items.Add(new ToolStripSeparator());
 
         var openLocation = MakeItem("Open File Location", delegate { OpenTargetLocation(path); });
         var linkProps = MakeItem("Link Properties", delegate { ShowProperties(path); });
@@ -246,17 +539,34 @@ internal static class Program
             changeIcon.Enabled = false;
         }
 
-        menu.Items.Add(openLocation);
-        menu.Items.Add(linkProps);
-        menu.Items.Add(fileProps);
+        items.Add(openLocation);
+        items.Add(linkProps);
+        items.Add(fileProps);
 
-        menu.Show(Cursor.Position);
+        ownerItem.ShowDropDown();
     }
 
     private static ToolStripMenuItem MakeItem(string text, EventHandler click)
     {
         var item = new ToolStripMenuItem(text);
-        item.Click += click;
+        item.Click += delegate(object sender, EventArgs e)
+        {
+            try
+            {
+                click(sender, e);
+            }
+            finally
+            {
+                KeepHostAliveForCommand = false;
+
+                if (!RefreshRequested &&
+                    (MainMenu == null || !MainMenu.Visible) &&
+                    HostForm != null && !HostForm.IsDisposed)
+                {
+                    HostForm.Close();
+                }
+            }
+        };
         return item;
     }
 
@@ -809,7 +1119,7 @@ internal static class Program
                 }
 
                 string shortcut = Path.Combine(PinRoot, name + ".lnk");
-                CreateShortcut(shortcut, ExePath, Quote(name), Root, icon, 0, name);
+                CreateShortcut(shortcut, ExePath, Quote(name), AppRoot, icon, 0, name);
 
                 Process.Start("explorer.exe", "/select," + Quote(shortcut));
 
@@ -864,7 +1174,7 @@ internal static class Program
             {
                 using (var ofd = new OpenFileDialog
                 {
-                    InitialDirectory = Directory.Exists(IconRoot) ? IconRoot : Root,
+                    InitialDirectory = Directory.Exists(IconRoot) ? IconRoot : AppRoot,
                     Filter = "Icon sources (*.ico;*.exe;*.dll)|*.ico;*.exe;*.dll|All files (*.*)|*.*"
                 })
                 {
@@ -899,11 +1209,11 @@ internal static class Program
                 string target, args, icon;
                 TryResolveShortcut(oldPin, out target, out args, out icon);
                 File.Move(oldPin, newPin);
-                CreateShortcut(newPin, ExePath, Quote(newName), Root, icon, 0, newName);
+                CreateShortcut(newPin, ExePath, Quote(newName), AppRoot, icon, 0, newName);
             }
             else
             {
-                CreateShortcut(newPin, ExePath, Quote(newName), Root, "", 0, newName);
+                CreateShortcut(newPin, ExePath, Quote(newName), AppRoot, "", 0, newName);
             }
 
             MessageBox.Show(
@@ -922,7 +1232,7 @@ internal static class Program
     {
         using (var ofd = new OpenFileDialog
         {
-            InitialDirectory = Directory.Exists(IconRoot) ? IconRoot : Root,
+            InitialDirectory = Directory.Exists(IconRoot) ? IconRoot : AppRoot,
             Title = "Select group icon",
             Filter = "Icon sources (*.ico;*.exe;*.dll)|*.ico;*.exe;*.dll|All files (*.*)|*.*"
         })
@@ -939,7 +1249,7 @@ internal static class Program
                 if (!TryResolveShortcut(pin, out target, out args, out oldIcon))
                     throw new InvalidOperationException("Could not read group shortcut.");
 
-                CreateShortcut(pin, target, args, Root, ofd.FileName, 0, Group);
+                CreateShortcut(pin, target, args, AppRoot, ofd.FileName, 0, Group);
 
                 MessageBox.Show(
                     "Group shortcut icon updated.\r\n\r\n" +
@@ -1138,10 +1448,6 @@ internal static class Program
                 link.SetIconLocation(iconPath, iconIndex);
 
             ((IPersistFile)obj).Save(linkPath, true);
-
-            // Shortcuts created from files/project content that carried Mark of the Web
-            // can inherit a Zone.Identifier stream. Remove it from every shortcut we
-            // create or rewrite so Windows does not show an Open File security prompt.
             RemoveZoneIdentifier(linkPath);
         }
         finally
@@ -1154,13 +1460,10 @@ internal static class Program
     {
         try
         {
-            string zoneStream = path + ":Zone.Identifier";
-            if (File.Exists(zoneStream))
-                File.Delete(zoneStream);
+            File.Delete(path + ":Zone.Identifier");
         }
         catch
         {
-            // Failure to remove zone metadata should not prevent shortcut creation.
         }
     }
 
@@ -1234,6 +1537,15 @@ internal static class Program
 
     private static void RefreshMenu()
     {
+        // A submenu Click closes its owning ContextMenuStrip before this method
+        // runs. Therefore MainMenu.Visible is normally false here. Restore from
+        // the position captured while the main menu was still open.
+        if (HaveLastMainMenuLocation)
+        {
+            ExactRestorePoint = LastMainMenuLocation;
+            UseExactRestorePoint = true;
+        }
+
         RefreshRequested = true;
         CloseMenu(true);
     }
@@ -1306,9 +1618,17 @@ internal static class Program
     private static void ApplyTheme(ToolStrip strip)
     {
         if (!IsDarkMode()) return;
+
+        Color foreground = Color.FromArgb(240, 240, 240);
         strip.BackColor = Color.FromArgb(32, 32, 32);
-        strip.ForeColor = Color.FromArgb(240, 240, 240);
+        strip.ForeColor = foreground;
         strip.Renderer = new ToolStripProfessionalRenderer(new DarkColorTable());
+
+        foreach (ToolStripItem item in strip.Items)
+        {
+            if (!(item is ToolStripSeparator))
+                item.ForeColor = foreground;
+        }
     }
 
     private sealed class DarkColorTable : ProfessionalColorTable
