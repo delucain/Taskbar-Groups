@@ -1,0 +1,45 @@
+# Generated launcher binary
+/Taskbar-GroupMenu.exe
+
+# User-specific group definitions and pin-ready shortcuts.
+# Keep placeholders so fresh clones contain the expected directories.
+/Groups/*
+!/Groups/.gitkeep
+/Pin to Taskbar/*
+!/Pin to Taskbar/.gitkeep
+
+# Update/source backups
+/_backups/
+Taskbar-GroupMenu.cs.backup-*
+Taskbar-GroupMenu-????????-??????.cs
+
+# Compiler/debug artifacts
+*.pdb
+*.ilk
+*.obj
+*.user
+*.suo
+
+# Visual Studio / VS Code metadata
+.vs/
+.vscode/
+
+# PowerShell/editor temporary files
+*.tmp
+*.temp
+*.bak
+*.swp
+*~
+~$*
+
+# OS metadata
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Downloaded/update packages
+*.zip
+
+# Obsolete fix-specific installers
+Install-TaskbarGroupMenu-*Fix*.ps1
+Install-TaskbarGroupMenu-*fix*.ps1
