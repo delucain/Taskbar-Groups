@@ -6,19 +6,43 @@ $ErrorActionPreference = 'Stop'
 
 $Root        = $PSScriptRoot
 $ReleaseRoot = Join-Path $Root '_release'
+$Source      = Join-Path $Root 'Taskbar-GroupMenu.cs'
 $Launcher    = Join-Path $Root 'Taskbar-GroupMenu.exe'
-$BuildScript = Join-Path $Root 'Build-TaskbarGroupMenu.ps1'
 $Iss         = Join-Path $Root 'installer\Taskbar-Groups.iss'
 
 New-Item -ItemType Directory -Force -Path $ReleaseRoot | Out-Null
 
 Write-Host "Building Taskbar Groups $Version..."
 
-& $BuildScript
+if (-not (Test-Path -LiteralPath $Source -PathType Leaf)) {
+    throw "Launcher source was not found: $Source"
+}
+
+$csc = @(
+    "$env:WINDIR\Microsoft.NET\Framework64\v4.0.30319\csc.exe",
+    "$env:WINDIR\Microsoft.NET\Framework\v4.0.30319\csc.exe"
+) | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
+
+if (-not $csc) {
+    throw 'Built-in .NET Framework C# compiler not found.'
+}
+
+& $csc /nologo /target:winexe /optimize+ `
+    /reference:System.dll `
+    /reference:System.Drawing.dll `
+    /reference:System.Windows.Forms.dll `
+    /out:"$Launcher" "$Source"
+
+if ($LASTEXITCODE -ne 0) {
+    throw "Compilation failed with exit code $LASTEXITCODE."
+}
 
 if (-not (Test-Path -LiteralPath $Launcher -PathType Leaf)) {
     throw "Launcher build did not create: $Launcher"
 }
+
+Unblock-File -LiteralPath $Launcher -ErrorAction SilentlyContinue
+Write-Host "Built $Launcher" 
 
 # Prevent existing Mark-of-the-Web metadata from being carried into the
 # installer payload. A downloaded installer may itself receive MOTW later;
@@ -82,3 +106,20 @@ Unblock-File -LiteralPath $setup -ErrorAction SilentlyContinue
 Write-Host ''
 Write-Host "Release built:"
 Write-Host "  $setup"
+
+Write-Host ''
+Write-Host "Installing Taskbar Groups $Version..."
+
+$installProcess = Start-Process `
+    -FilePath $setup `
+    -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART' `
+    -Verb RunAs `
+    -Wait `
+    -PassThru
+
+if ($installProcess.ExitCode -ne 0) {
+    throw "Installer failed with exit code $($installProcess.ExitCode)."
+}
+
+Write-Host ''
+Write-Host "Release installed successfully."

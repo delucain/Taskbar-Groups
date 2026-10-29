@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
@@ -890,6 +890,8 @@ internal static class Program
             try
             {
                 string target = Environment.ExpandEnvironmentVariables(dialog.TargetPath.Trim());
+                string arguments = dialog.Arguments ?? "";
+
                 if (!File.Exists(target) && !Directory.Exists(target))
                     throw new FileNotFoundException("Target does not exist.", target);
 
@@ -904,7 +906,15 @@ internal static class Program
                 string linkPath = UniquePath(Path.Combine(GroupFolder,
                     PrefixName(prefix, name, ".lnk")));
 
-                CreateShortcut(linkPath, target, "", Path.GetDirectoryName(target),
+                string workingDirectory = File.Exists(target)
+                    ? Path.GetDirectoryName(target)
+                    : target;
+
+                // The dialog is the source of truth. When an existing .lnk is
+                // selected, AddLinkDialog resolves its target and arguments into
+                // the visible fields. Create the new shortcut from those values so
+                // the imported arguments are preserved and remain editable.
+                CreateShortcut(linkPath, target, arguments, workingDirectory,
                     dialog.IconPath, 0, name);
 
                 RefreshMenu();
@@ -916,10 +926,14 @@ internal static class Program
     private sealed class AddLinkDialog : Form
     {
         private readonly TextBox target = new TextBox();
+        private readonly TextBox arguments = new TextBox();
         private readonly TextBox name = new TextBox();
         private readonly TextBox icon = new TextBox();
+        private string selectedShortcut = "";
 
+        public string SelectedShortcut { get { return selectedShortcut; } }
         public string TargetPath { get { return target.Text; } }
+        public string Arguments { get { return arguments.Text; } }
         public string LinkName { get { return name.Text; } }
         public string IconPath { get { return icon.Text; } }
 
@@ -931,29 +945,32 @@ internal static class Program
             MaximizeBox = false;
             MinimizeBox = false;
             ShowInTaskbar = false;
-            ClientSize = new Size(590, 166);
+            ClientSize = new Size(590, 204);
 
             AddLabel("Target:", 12, 18);
             target.SetBounds(82, 15, 405, 23);
             var browseTarget = new Button { Text = "Browse..." };
             browseTarget.SetBounds(495, 14, 82, 25);
 
-            AddLabel("Name:", 12, 56);
-            name.SetBounds(82, 53, 495, 23);
+            AddLabel("Arguments:", 12, 56);
+            arguments.SetBounds(82, 53, 495, 23);
 
-            AddLabel("Icon:", 12, 94);
-            icon.SetBounds(82, 91, 405, 23);
+            AddLabel("Name:", 12, 94);
+            name.SetBounds(82, 91, 495, 23);
+
+            AddLabel("Icon:", 12, 132);
+            icon.SetBounds(82, 129, 405, 23);
             icon.ReadOnly = true;
             icon.Text = "(Default)";
             var browseIcon = new Button { Text = "Browse..." };
-            browseIcon.SetBounds(495, 90, 82, 25);
+            browseIcon.SetBounds(495, 128, 82, 25);
 
             var add = new Button { Text = "Add", DialogResult = DialogResult.OK };
-            add.SetBounds(405, 129, 82, 27);
+            add.SetBounds(405, 167, 82, 27);
             var cancel = new Button { Text = "Cancel", DialogResult = DialogResult.Cancel };
-            cancel.SetBounds(495, 129, 82, 27);
+            cancel.SetBounds(495, 167, 82, 27);
 
-            Controls.AddRange(new Control[] { target, name, icon, browseTarget, browseIcon, add, cancel });
+            Controls.AddRange(new Control[] { target, arguments, name, icon, browseTarget, browseIcon, add, cancel });
             AcceptButton = add;
             CancelButton = cancel;
 
@@ -962,14 +979,49 @@ internal static class Program
                 using (var ofd = new OpenFileDialog
                 {
                     Title = "Select target",
-                    Filter = "All files (*.*)|*.*"
+                    Filter = "All files (*.*)|*.*",
+                    DereferenceLinks = false
                 })
                 {
                     if (ofd.ShowDialog(this) == DialogResult.OK)
                     {
-                        target.Text = ofd.FileName;
+                        string selected = ofd.FileName;
+
+                        if (Path.GetExtension(selected).Equals(".lnk", StringComparison.OrdinalIgnoreCase))
+                        {
+                            string resolvedTarget, resolvedArguments, resolvedIcon;
+                            if (!TryResolveShortcut(selected,
+                                out resolvedTarget, out resolvedArguments, out resolvedIcon))
+                            {
+                                MessageBox.Show(this,
+                                    "Could not read the selected shortcut.",
+                                    "Add Link",
+                                    MessageBoxButtons.OK,
+                                    MessageBoxIcon.Error);
+                                return;
+                            }
+
+                            target.Text = resolvedTarget;
+                            arguments.Text = resolvedArguments;
+
+                            // Preserve the existing shortcut icon when it explicitly
+                            // defines one. Otherwise leave "(Default)" so Windows
+                            // uses the target application's normal icon.
+                            string iconFile;
+                            int iconIndex;
+                            ParseIconLocation(resolvedIcon, out iconFile, out iconIndex);
+                            icon.Text = String.IsNullOrWhiteSpace(iconFile)
+                                ? "(Default)"
+                                : iconFile;
+                        }
+                        else
+                        {
+                            target.Text = selected;
+                            arguments.Text = "";
+                        }
+
                         if (String.IsNullOrWhiteSpace(name.Text))
-                            name.Text = Path.GetFileNameWithoutExtension(ofd.FileName);
+                            name.Text = Path.GetFileNameWithoutExtension(selected);
                     }
                 }
             };
@@ -1390,20 +1442,22 @@ internal static class Program
     [Guid("00021401-0000-0000-C000-000000000046")]
     private class ShellLink { }
 
-    [ComImport]
-    [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
-    [Guid("000214F9-0000-0000-C000-000000000046")]
+    [ComImport, InterfaceType(ComInterfaceType.InterfaceIsIUnknown),
+     Guid("000214F9-0000-0000-C000-000000000046")]
     private interface IShellLinkW
     {
-        void GetPath([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder pszFile, int cch,
-            IntPtr pfd, uint fFlags);
+        void GetPath([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder pszFile,
+            int cch, IntPtr pfd, uint fFlags);
         void GetIDList(out IntPtr ppidl);
         void SetIDList(IntPtr pidl);
-        void GetDescription([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder pszName, int cch);
+        void GetDescription([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder pszName,
+            int cch);
         void SetDescription([MarshalAs(UnmanagedType.LPWStr)] string pszName);
-        void GetWorkingDirectory([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder pszDir, int cch);
+        void GetWorkingDirectory([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder pszDir,
+            int cch);
         void SetWorkingDirectory([MarshalAs(UnmanagedType.LPWStr)] string pszDir);
-        void GetArguments([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder pszArgs, int cch);
+        void GetArguments([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder pszArgs,
+            int cch);
         void SetArguments([MarshalAs(UnmanagedType.LPWStr)] string pszArgs);
         void GetHotkey(out short pwHotkey);
         void SetHotkey(short wHotkey);
@@ -1456,6 +1510,22 @@ internal static class Program
         }
     }
 
+    private static void SetShortcutIcon(string linkPath, string iconPath, int iconIndex)
+    {
+        object obj = new ShellLink();
+        try
+        {
+            ((IPersistFile)obj).Load(linkPath, 0);
+            ((IShellLinkW)obj).SetIconLocation(iconPath, iconIndex);
+            ((IPersistFile)obj).Save(linkPath, true);
+            RemoveZoneIdentifier(linkPath);
+        }
+        finally
+        {
+            if (Marshal.IsComObject(obj)) Marshal.FinalReleaseComObject(obj);
+        }
+    }
+
     private static void RemoveZoneIdentifier(string path)
     {
         try
@@ -1491,7 +1561,13 @@ internal static class Program
             link.GetIconLocation(icon, icon.Capacity, out iconIndex);
 
             target = Environment.ExpandEnvironmentVariables(path.ToString());
-            arguments = args.ToString();
+
+            string fileArguments;
+            if (TryReadShortcutArgumentsFromFile(linkPath, out fileArguments))
+                arguments = fileArguments;
+            else
+                arguments = args.ToString();
+
             iconLocation = icon.Length == 0 ? "" : icon + "," + iconIndex;
             return !String.IsNullOrWhiteSpace(target);
         }
@@ -1500,6 +1576,61 @@ internal static class Program
         {
             if (obj != null && Marshal.IsComObject(obj)) Marshal.FinalReleaseComObject(obj);
         }
+    }
+
+    private static bool TryReadShortcutArgumentsFromFile(string linkPath,
+        out string arguments)
+    {
+        arguments = "";
+        try
+        {
+            byte[] data = File.ReadAllBytes(linkPath);
+            if (data.Length < 0x4C) return false;
+
+            uint flags = BitConverter.ToUInt32(data, 0x14);
+            int offset = 0x4C;
+
+            if ((flags & 0x00000001) != 0)
+            {
+                if (offset + 2 > data.Length) return false;
+                int size = BitConverter.ToUInt16(data, offset);
+                offset += 2 + size;
+                if (offset > data.Length) return false;
+            }
+
+            if ((flags & 0x00000002) != 0)
+            {
+                if (offset + 4 > data.Length) return false;
+                uint size = BitConverter.ToUInt32(data, offset);
+                if (size < 4 || offset + size > data.Length) return false;
+                offset += (int)size;
+            }
+
+            bool unicode = (flags & 0x00000080) != 0;
+            uint[] fields = { 0x04, 0x08, 0x10, 0x20, 0x40 };
+
+            foreach (uint field in fields)
+            {
+                if ((flags & field) == 0) continue;
+                if (offset + 2 > data.Length) return false;
+
+                int chars = BitConverter.ToUInt16(data, offset);
+                offset += 2;
+                int bytes = unicode ? chars * 2 : chars;
+                if (offset + bytes > data.Length) return false;
+
+                if (field == 0x20)
+                {
+                    arguments = unicode
+                        ? Encoding.Unicode.GetString(data, offset, bytes)
+                        : Encoding.Default.GetString(data, offset, bytes);
+                    return true;
+                }
+                offset += bytes;
+            }
+            return true;
+        }
+        catch { return false; }
     }
 
     // ---------- UI helpers ----------
