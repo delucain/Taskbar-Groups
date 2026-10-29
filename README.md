@@ -1,60 +1,79 @@
 # Taskbar Groups
 
-Taskbar Groups is a lightweight Windows 10 taskbar launcher that
-provides user-defined popup groups from pinned taskbar icons.
+Taskbar Groups is a lightweight Windows taskbar launcher that provides user-defined popup groups from pinned taskbar icons.
 
-Each group is represented by a normal Windows shortcut pinned to the
-taskbar. Clicking that shortcut launches `Taskbar-GroupMenu.exe` with
-the group name. The launcher reads the corresponding directory under
-`Groups\` and displays its contents as a native WinForms popup menu at
-the mouse cursor.
+Each group appears as a normal Windows shortcut that can be pinned to the taskbar. Clicking it launches `Taskbar-GroupMenu.exe` for that group and displays its contents as a compact native WinForms popup menu at the mouse cursor.
 
-The project is intentionally file-system driven. Group contents,
-ordering, headings, separators, icons, and shortcuts are represented by
-ordinary files rather than a separate configuration database.
+The project is intentionally file-system driven: group contents, ordering, headings, separators, icons, and shortcuts are represented by ordinary files rather than a separate configuration database.
+
+## Screenshots
+
+### Group menu and management
+
+Groups can contain normal shortcuts, section headers, and separators. The **Group Options** submenu provides commands for adding and managing group contents.
+
+![Taskbar Groups Utilities menu showing headers, separators, shortcuts, and Group Options](docs/screenshots/group-menu.png)
+
+### Adding links
+
+Links can target applications, files, folders, scripts, or other Windows targets. Optional command-line arguments and a custom icon can also be supplied.
+
+![Add Link dialog](docs/screenshots/add-link.png)
+
+### Creating groups
+
+New groups can be created directly from the launcher and assigned a custom icon.
+
+![New Group dialog](docs/screenshots/new-group.png)
+
+### Included icon library
+
+The included icon library provides bordered variants intended for taskbar groups. The common border gives group launchers a consistent visual identity and distinguishes them from ordinary pinned applications.
+
+![Bordered group icon library](docs/screenshots/group-icon-library.png)
+
+Matching unframed icons are included for normal shortcuts and other uses.
+
+![Standard icon library](docs/screenshots/standard-icon-library.png)
 
 ## Features
 
--   Multiple independent taskbar groups.
--   Native Windows taskbar shortcuts for launching groups.
--   Supports `.lnk`, `.url`, `.exe`, `.bat`, `.cmd`, and `.ps1` group
-    items.
--   Resolves Windows shortcut icons, including explicit icon resources
-    and executable targets.
--   Supports packaged Windows application shortcuts when the `.lnk` was
-    created through the Windows shell.
--   Numeric filename prefixes control display order.
--   Drag-and-drop reordering automatically normalizes prefixes to `010`,
-    `020`, `030`, and so on.
--   Section headings and separators can be inserted between launcher
-    items and reordered with the rest of the group.
--   Headers and separators use distinct styling so sections are visually
-    apparent.
--   Per-item management menu for moving, inserting, renaming, changing
-    icons, removing items, and opening shortcut/file properties.
--   Group-level management menu for adding links, headings, separators,
-    renaming groups, changing group icons, creating groups, and deleting
-    groups.
--   Dark/light mode follows the Windows app theme.
--   Group menus reopen at the same screen position after management
-    operations.
--   Reusable icon library for group shortcuts.
--   No third-party runtime is required. The launcher is built with the
-    .NET Framework C# compiler included with Windows.
+- Multiple independent taskbar groups.
+- Native Windows taskbar shortcuts for launching groups.
+- Supports `.lnk`, `.url`, `.exe`, `.bat`, `.cmd`, and `.ps1` group items.
+- Supports command-line arguments when creating shortcuts.
+- Resolves Windows shortcut icons, including explicit icon resources and executable targets.
+- Supports packaged Windows application shortcuts when the `.lnk` was created through the Windows shell.
+- Numeric filename prefixes control display order.
+- Drag-and-drop reordering automatically normalizes prefixes to `010`, `020`, `030`, and so on.
+- Section headings and separators can be inserted between launcher items and reordered with the rest of the group.
+- Headers and separators use distinct styling so sections are visually apparent.
+- Per-item management commands for moving, inserting, renaming, changing icons, removing items, and opening shortcut/file properties.
+- Group-level management commands for adding links, headings, separators, renaming groups, changing group icons, creating groups, and deleting groups.
+- Dark/light mode follows the Windows app theme.
+- Group menus reopen at the same screen position after management operations.
+- Reusable standard and bordered group icon libraries.
+- No third-party runtime is required for the launcher.
 
-## Installed layout
+## Installation
 
-Taskbar Groups separates read-only application files from per-user data.
+Download the latest `Taskbar-Groups-Setup-vX.Y.Z.exe` from the GitHub Releases page and run it.
+
+The installer places the application under:
 
 ```text
 C:\Program Files\Taskbar Groups\
 ├── Taskbar-GroupMenu.exe
 ├── Icon Library\
-│   └── *.ico
+│   ├── *.ico
+│   └── Group Icons\
+│       └── *.ico
 └── _templates\
     ├── Section Heading.heading
     └── Spacer.separator
 ```
+
+Taskbar Groups creates per-user data when it runs:
 
 ```text
 %LOCALAPPDATA%\Taskbar-Groups\
@@ -64,165 +83,57 @@ C:\Program Files\Taskbar Groups\
     └── <Group Name>.lnk
 ```
 
-The source repository may live anywhere. Build scripts resolve paths from
-their own location rather than requiring a fixed development directory.
-
-## Requirements
-
-- Windows 10 or later.
-- Windows PowerShell 5.1 or later for development/maintenance scripts.
-- .NET Framework 4.x with the standard Windows C# compiler (`csc.exe`) to build from source.
-- Inno Setup 6 to create the distributable installer.
-
-## Installation
-
-For normal users, run:
-
-```text
-Taskbar-Groups-Setup-v1.0.0.exe
-```
-
-The installer places application files in `C:\Program Files\Taskbar Groups`
-and user data in `%LOCALAPPDATA%\Taskbar-Groups`.
-
-When upgrading an older development-layout installation, the installer looks
-for legacy groups under `C:\code\_Scripts\Taskbar-Groups\Groups`, copies any
-groups that do not already exist in the new user-data directory, and rebuilds
-pin-ready shortcuts so they target the installed executable. Existing user
-data is not overwritten.
-
-Uninstalling the application intentionally leaves `%LOCALAPPDATA%\Taskbar-Groups`
-in place so uninstall/reinstall does not delete a user's groups.
-
-## Building from source
-
-From the repository root:
-
-```powershell
-.\Build-TaskbarGroupMenu.ps1
-```
-
-To build a release installer:
-
-```powershell
-.\Build-Release.ps1 -Version 1.0.0
-```
-
-The finished installer is written to `_release\Taskbar-Groups-Setup-v1.0.0.exe`.
-`Build-Release.ps1` also removes Mark of the Web from release payloads before
-packaging them.
-
-`Install-TaskbarGroups.ps1` remains available as a manual/source-tree install
-path. It requires elevation because it writes application files to Program
-Files. `Setup-TaskbarGroup.ps1` creates or refreshes an individual group's
-pin-ready shortcut in `%LOCALAPPDATA%\Taskbar-Groups\Pin to Taskbar`.
+Application files and user data are deliberately separated. Uninstalling Taskbar Groups does **not** delete `%LOCALAPPDATA%\Taskbar-Groups`, so uninstalling or upgrading the application does not destroy configured groups.
 
 ## Creating a group
 
-Groups can be created from the launcher itself:
+Open an existing group and choose:
 
-``` text
+```text
 Group Options
 └── New Group
 ```
 
-The New Group dialog accepts a group name and an optional icon. Creating
-a group:
+Enter a name and optionally select an icon. Creating a group:
 
-1.  Creates `Groups\<Group Name>\`.
-2.  Creates a shortcut under `Pin to Taskbar\<Group Name>.lnk`.
-3.  Configures the shortcut to launch
-    `Taskbar-GroupMenu.exe "<Group Name>"`.
-4.  Opens/selects the new shortcut so it can be pinned normally.
+1. Creates `%LOCALAPPDATA%\Taskbar-Groups\Groups\<Group Name>\`.
+2. Creates `%LOCALAPPDATA%\Taskbar-Groups\Pin to Taskbar\<Group Name>.lnk`.
+3. Configures the shortcut to launch `Taskbar-GroupMenu.exe "<Group Name>"`.
+4. Opens Explorer with the new shortcut selected so it can be pinned to the taskbar.
 
-Groups can also be prepared with `Setup-TaskbarGroup.ps1`.
+Once the shortcut is pinned, clicking its taskbar icon opens the group.
 
-## Using a group
+## Adding links
 
-Click a pinned group icon on the taskbar. The launcher opens the
-corresponding popup menu at the current cursor position.
+At the group level:
 
-Selecting a normal item launches it and closes the popup.
-
-Supported launchable item types are:
-
-``` text
-.lnk
-.url
-.exe
-.bat
-.cmd
-.ps1
+```text
+Group Options
+└── Add Link
 ```
 
-The group directory can also contain:
+For a specific insertion point, open an existing item's submenu and choose:
 
-``` text
-.heading
-.separator
+```text
+Add Link Below
 ```
 
-These are layout elements and are not launched.
+The Add Link dialog supports:
 
-## Ordering
+- Target
+- Command-line arguments
+- Display name
+- Optional icon source
 
-Items are ordered by the numeric prefix in their filenames.
-
-The normal numbering convention is:
-
-``` text
-010 - First Item.lnk
-020 - Second Item.lnk
-030 - Third Item.lnk
-040 - Fourth Item.lnk
-```
-
-The gaps make manual insertion possible without immediately renumbering
-the entire group.
-
-### Drag-and-drop ordering
-
-Items, headings, and separators can be reordered directly in the popup
-menu.
-
-Drag an item to the desired position and release it. After the drop, the
-group is renumbered in canonical increments of ten:
-
-``` text
-010
-020
-030
-040
-...
-```
-
-This makes the filesystem ordering match the visual ordering.
-
-### Renumbering utility
-
-`Renumber-TaskbarGroups.ps1` is intended for bulk normalization/setup.
-
-It alphabetically renumbers group contents in increments of ten.
-
-Do **not** run it casually after manually arranging a group with
-headings and separators. Its purpose is bulk alphabetical renumbering,
-so it can intentionally destroy a hand-arranged section layout.
+The resulting `.lnk` is created in the group's directory with an appropriate numeric ordering prefix.
 
 ## Headers and separators
 
-Headers and separators are ordinary files using custom extensions.
+Groups can contain structural rows as well as launchable items.
 
-Templates are stored in:
+Use:
 
-``` text
-_templates\Section Heading.heading
-_templates\Spacer.separator
-```
-
-Use the launcher commands rather than manually copying the templates
-when convenient:
-
-``` text
+```text
 Group Options
 ├── Add Header
 └── Add Separator
@@ -230,45 +141,44 @@ Group Options
 
 Individual items also provide:
 
-``` text
+```text
 Insert Header Above
 Insert Separator Below
 ```
 
-Headers and separators participate in normal ordering and drag-and-drop
-reordering.
+Headers use `.heading` files and separators use `.separator` files. Both participate in normal ordering and drag-and-drop reordering.
 
-## Adding links
+## Ordering and reordering
 
-At the group level:
+Items are stored with numeric filename prefixes:
 
-``` text
-Group Options
-└── Add Link
+```text
+010 - First Item.lnk
+020 - Second Item.lnk
+030 - Section.heading
+040 - Another Item.lnk
+050 - Spacer.separator
 ```
 
-For a specific insertion point, right-click an existing item and choose:
+The prefixes define the visual order.
 
-``` text
-Add Link Below
+Items, headings, and separators can be dragged directly within the popup menu. After a drop, Taskbar Groups renumbers the group in canonical increments of ten:
+
+```text
+010
+020
+030
+040
+...
 ```
 
-The Add Link dialog allows selection of:
-
--   Target
--   Display name
--   Optional icon source
-
-The resulting shortcut is created in the group's directory with an
-appropriate numeric prefix.
+This keeps the filesystem order synchronized with the visual order while leaving gaps for manual insertion.
 
 ## Item management
 
-Right-click a launcher item to open its management submenu.
+Open an item's submenu to access commands such as:
 
-Available commands include:
-
-``` text
+```text
 Move Up
 Move Down
 ────────────────────────
@@ -285,21 +195,20 @@ Link Properties
 File Properties
 ```
 
-Commands that do not apply to a particular item type are disabled or
-omitted.
+Commands that do not apply to a particular item type are disabled or omitted.
 
 ## Group management
 
 The bottom of every group contains:
 
-``` text
+```text
 Open <Group> folder
 Group Options
 ```
 
 `Group Options` provides:
 
-``` text
+```text
 Add Link
 Add Header
 Add Separator
@@ -310,132 +219,117 @@ New Group
 Delete Group
 ```
 
-Deleting a group removes the group's launcher data and pin-ready
-shortcut. It does not delete the applications or files targeted by
-shortcuts inside the group.
+Deleting a group removes its group directory and pin-ready shortcut. It does not delete any applications or files targeted by shortcuts inside the group.
+
+## Supported item types
+
+Launchable group items:
+
+```text
+.lnk
+.url
+.exe
+.bat
+.cmd
+.ps1
+```
+
+Layout items:
+
+```text
+.heading
+.separator
+```
 
 ## Icon library
 
-`Icon Library\` contains reusable `.ico` files intended primarily for
-the taskbar group shortcuts.
+The installed `Icon Library\` contains reusable `.ico` files.
 
-Group icons use a common visual language so they can be distinguished
-from ordinary application icons on the taskbar.
+Standard icons live directly under:
 
-The library is source material and should be kept under version control.
+```text
+C:\Program Files\Taskbar Groups\Icon Library\
+```
+
+Bordered variants designed for taskbar group launchers live under:
+
+```text
+C:\Program Files\Taskbar Groups\Icon Library\Group Icons\
+```
+
+The bordered set uses a common frame so group launchers remain visually distinct from ordinary pinned applications.
+
+When changing an item or group icon, Taskbar Groups also accepts icons from `.ico`, `.exe`, and `.dll` files.
 
 ## Shortcut icon resolution
 
-For `.lnk` files, the launcher attempts to resolve icons in this order:
+For `.lnk` files, Taskbar Groups attempts to resolve icons in this order:
 
-1.  Explicit `IconLocation` stored in the shortcut, including resource
-    index.
-2.  The shortcut's target executable.
-3.  Windows shell-associated shortcut icon fallback.
+1. Explicit `IconLocation` stored in the shortcut, including its resource index.
+2. The shortcut's target executable.
+3. Windows shell-associated shortcut icon fallback.
 
-Executable and DLL icon resources are extracted through the Windows
-shell/native icon APIs.
-
-This logic is important for shortcuts whose icons are stored in
-executable resources rather than standalone `.ico` files.
+Executable and DLL icon resources are extracted through Windows shell/native icon APIs.
 
 ## Dark and light themes
 
-The launcher reads:
+Taskbar Groups follows the Windows application theme.
 
-``` text
-HKCU\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize\AppsUseLightTheme
+In dark mode it uses a custom WinForms renderer. Light mode uses the standard Windows appearance. Headers and separators receive additional styling so structural rows remain visually distinct from normal launcher items.
+
+## Building from source
+
+### Requirements
+
+- Windows 10 or later.
+- Windows PowerShell 5.1 or later.
+- .NET Framework 4.x with the standard Windows C# compiler (`csc.exe`).
+- Inno Setup 6 for building the distributable installer.
+
+`Taskbar-GroupMenu.cs` is the canonical launcher source.
+
+To build a release from the repository root:
+
+```powershell
+.\Build-Release.ps1 -Version 1.0.1
 ```
 
-each time it is invoked.
+`Build-Release.ps1`:
 
-Dark mode uses a custom WinForms renderer. Light mode uses the standard
-Windows appearance. Headers and separators receive additional styling to
-distinguish structural rows from normal launcher items.
+1. Compiles `Taskbar-GroupMenu.cs` into `Taskbar-GroupMenu.exe`.
+2. Removes Mark of the Web metadata from files being packaged.
+3. Invokes Inno Setup.
+4. Creates `_release\Taskbar-Groups-Setup-v1.0.1.exe`.
+5. Installs the newly built release locally for testing.
 
-## Building after source changes
+The version number is supplied with `-Version`; use the version you are actually building.
 
-`Taskbar-GroupMenu.cs` is the **canonical source file**.
+## Repository layout
 
-After editing it, rebuild with:
-
-``` powershell
-.\Build-TaskbarGroupMenu.ps1
+```text
+Taskbar-Groups\
+├── Taskbar-GroupMenu.cs
+├── Build-Release.ps1
+├── README.md
+├── LICENSE
+├── Icon Library\
+│   ├── *.ico
+│   └── Group Icons\
+│       └── *.ico
+├── _templates\
+│   ├── Section Heading.heading
+│   └── Spacer.separator
+├── installer\
+│   ├── Taskbar-Groups.iss
+│   └── Install-UserData.ps1
+└── docs\
+    └── screenshots\
 ```
 
-Do not create alternate source filenames for individual fixes.
+`installer\Install-UserData.ps1` is retained only to prevent older working trees from continuing to use the previous elevated per-user installation behavior. Current versions initialize `%LOCALAPPDATA%\Taskbar-Groups` from the application itself.
 
-## Updating the project
+Generated files such as `Taskbar-GroupMenu.exe`, `_release\`, compiler artifacts, temporary files, and ZIP archives are excluded by `.gitignore`.
 
-The canonical updater is:
+## License
 
-``` text
-Update-TaskbarGroupMenu.ps1
-```
-
-Future source updates should replace this same updater rather than
-creating fix-specific installers.
-
-The update workflow is:
-
-1.  Back up the existing `Taskbar-GroupMenu.cs` into `_backups\`.
-2.  Replace the canonical `Taskbar-GroupMenu.cs`.
-3.  Invoke `Build-TaskbarGroupMenu.ps1`.
-4.  Continue using the same canonical filenames.
-
-This avoids accumulating scripts such as:
-
-``` text
-Install-SomeFix.ps1
-Install-AnotherFix.ps1
-Taskbar-GroupMenu-new.cs
-Taskbar-GroupMenu-final.cs
-Taskbar-GroupMenu-final2.cs
-```
-
-The project root should always make it obvious which source and build
-scripts are current.
-
-## Git/version-control policy
-
-Source, scripts, templates, and reusable icon-library assets are intended
-to remain visible to Git.
-
-The contents of `Groups\` and `Pin to Taskbar\` are **user-specific
-runtime/configuration data** and are not committed. The directories
-themselves are retained in the repository with `.gitkeep` placeholders so
-a fresh checkout has the expected structure.
-
-Generated, transient, and user-specific files are ignored:
-
--   `Taskbar-GroupMenu.exe`
--   everything under `Groups\` except `Groups\.gitkeep`
--   everything under `Pin to Taskbar\` except `Pin to Taskbar\.gitkeep`
--   `_backups\`
--   compiler/debug artifacts such as `.pdb`
--   temporary files
--   editor/IDE metadata
--   downloaded update ZIPs
--   accidental fix-specific installer/update packages
--   timestamped source backups
-
-There is no blanket `*.lnk` ignore rule. The user-specific directories are
-ignored regardless of the file types stored inside them.
-
-## Canonical files
-
-For future maintenance:
-
-  Purpose                   Canonical file
-  ------------------------- -------------------------------
-  Launcher source           `Taskbar-GroupMenu.cs`
-  Launcher executable       `Taskbar-GroupMenu.exe`
-  Build                     `Build-TaskbarGroupMenu.ps1`
-  Updates                   `Update-TaskbarGroupMenu.ps1`
-  Full installation/setup   `Install-TaskbarGroups.ps1`
-  Individual group setup    `Setup-TaskbarGroup.ps1`
-  Bulk renumbering          `Renumber-TaskbarGroups.ps1`
-
-If a future change requires modifying the launcher, modify
-`Taskbar-GroupMenu.cs` and rebuild it. Do not introduce another
-competing "current" source or build script.
+Taskbar Groups is released under the MIT License. See [LICENSE](LICENSE).
