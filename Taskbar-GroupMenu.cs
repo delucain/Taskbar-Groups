@@ -6,6 +6,7 @@ using System.IO;
 using System.IO.Pipes;
 using System.Linq;
 using System.Runtime.InteropServices;
+using System.Reflection;
 using System.Security.Cryptography;
 using System.Security.AccessControl;
 using System.Security.Principal;
@@ -16,6 +17,35 @@ using System.Windows.Forms;
 
 internal static class Program
 {
+    // Windows 10 RS5+ removed the old taskbarpin shell verb from automation.
+    // Explorer/Chromium use this native taskband COM interface instead.
+    [ComImport]
+    [Guid("0DD79AE2-D156-45D4-9EEB-3B549769E940")]
+    [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    private interface IPinnedList3
+    {
+        [PreserveSig] int EnumObjects();
+        [PreserveSig] int GetPinnableInfo();
+        [PreserveSig] int IsPinnable();
+        [PreserveSig] int Resolve();
+        [PreserveSig] int LegacyModify();
+        [PreserveSig] int GetChangeCount();
+        [PreserveSig] int IsPinned(IntPtr pidl);
+        [PreserveSig] int GetPinnedItem();
+        [PreserveSig] int GetAppIDForPinnedItem();
+        [PreserveSig] int ItemChangeNotify();
+        [PreserveSig] int UpdateForRemovedItemsAsNecessary();
+        [PreserveSig] int PinShellLink();
+        [PreserveSig] int GetPinnedItemForAppID();
+        [PreserveSig] int Modify(IntPtr unpin, IntPtr pin, int caller);
+    }
+
+    [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
+    private static extern IntPtr ILCreateFromPath(string pszPath);
+
+    [DllImport("shell32.dll")]
+    private static extern void ILFree(IntPtr pidl);
+
     private static readonly string AppRoot = Application.StartupPath;
     private static readonly string DataRoot = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
@@ -124,6 +154,20 @@ internal static class Program
     [STAThread]
     private static void Main(string[] args)
     {
+        // Explorer shell context-menu entry. This is intentionally a standalone
+        // dialog process: it does not need to become or contact the resident menu host.
+        if (args.Length >= 2 &&
+            String.Equals(args[0], "--pin-to-group", StringComparison.OrdinalIgnoreCase))
+        {
+            InitializeWinForms();
+            Directory.CreateDirectory(DataRoot);
+            Directory.CreateDirectory(GroupsRoot);
+            Directory.CreateDirectory(PinRoot);
+            Directory.CreateDirectory(IconCacheRoot);
+            AddLinkFromExplorer(args[1]);
+            return;
+        }
+
         // Native Shell property sheets get their own process.
         if (args.Length >= 2 &&
             String.Equals(args[0], "--link-properties-worker", StringComparison.OrdinalIgnoreCase))
@@ -662,8 +706,8 @@ internal static class Program
         string requestedFolder = Path.Combine(GroupsRoot, requestedGroup);
         if (!Directory.Exists(requestedFolder))
         {
-            MessageBox.Show("Taskbar group folder does not exist:\r\n" + requestedFolder,
-                "Taskbar Groups", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            LogInfo("Requested group folder is missing: " + requestedFolder);
+            ShowMissingGroupDialog(requestedGroup, requestedFolder);
             return;
         }
 
@@ -908,6 +952,7 @@ internal static class Program
         options.DropDownItems.Add(MakeItem("Rename Group", delegate { RenameGroup(); }));
         options.DropDownItems.Add(MakeItem("Change Group Icon", delegate { ChangeGroupIcon(); }));
         options.DropDownItems.Add(MakeItem("New Group", delegate { NewGroup(); }));
+        options.DropDownItems.Add(MakeItem("Unpin Group from Taskbar", delegate { UnpinCurrentGroup(); }));
         options.DropDownItems.Add(MakeItem("Delete Group", delegate { DeleteGroup(); }));
 
         // This fires before WinForms closes the owning ContextMenuStrip.
@@ -1642,12 +1687,43 @@ internal static class Program
 
     private static void AddLink(string anchorPath, bool relative)
     {
-        using (var dialog = new AddLinkDialog())
+        AddLinkCore(anchorPath, relative, null, Group);
+    }
+
+    private static void AddLinkFromExplorer(string selectedPath)
+    {
+        try
+        {
+            selectedPath = Environment.ExpandEnvironmentVariables(selectedPath ?? "");
+            if (!File.Exists(selectedPath) && !Directory.Exists(selectedPath))
+                throw new FileNotFoundException("The selected item no longer exists.", selectedPath);
+
+            AddLinkCore(null, false, selectedPath, null);
+        }
+        catch (Exception ex)
+        {
+            Error("Could not pin item to a Taskbar Group.", ex);
+        }
+    }
+
+    private static void AddLinkCore(string anchorPath, bool relative,
+        string initialTarget, string initialGroup)
+    {
+        using (var dialog = new AddLinkDialog(initialTarget, initialGroup))
         {
             if (dialog.ShowDialog() != DialogResult.OK) return;
 
             try
             {
+                string selectedGroup = dialog.SelectedGroup;
+                if (String.IsNullOrWhiteSpace(selectedGroup))
+                    throw new InvalidOperationException("Choose a group.");
+
+                string destinationFolder = Path.Combine(GroupsRoot, selectedGroup);
+                if (!Directory.Exists(destinationFolder))
+                    throw new DirectoryNotFoundException(
+                        "The selected group no longer exists: " + selectedGroup);
+
                 string target = Environment.ExpandEnvironmentVariables(dialog.TargetPath.Trim());
                 string arguments = dialog.Arguments ?? "";
 
@@ -1670,25 +1746,46 @@ internal static class Program
                     arguments = scriptArguments;
                 }
 
-                int prefix = relative
-                    ? GetInsertionPrefix(anchorPath, false)
-                    : GetInsertionPrefix(null, false);
+                // Preserve "Add Link Above/Below" positioning only when the user
+                // leaves the destination on the group from which the command was
+                // invoked. If they choose another group, append there instead.
+                bool useRelativeInsertion =
+                    relative &&
+                    !String.IsNullOrWhiteSpace(initialGroup) &&
+                    String.Equals(selectedGroup, initialGroup, StringComparison.OrdinalIgnoreCase);
 
-                string linkPath = UniquePath(Path.Combine(GroupFolder,
+                string previousGroupFolder = GroupFolder;
+                GroupFolder = destinationFolder;
+                int prefix;
+                try
+                {
+                    prefix = useRelativeInsertion
+                        ? GetInsertionPrefix(anchorPath, false)
+                        : GetInsertionPrefix(null, false);
+                }
+                finally
+                {
+                    GroupFolder = previousGroupFolder;
+                }
+
+                string linkPath = UniquePath(Path.Combine(destinationFolder,
                     PrefixName(prefix, name, ".lnk")));
 
                 string workingDirectory = File.Exists(selectedTarget)
                     ? Path.GetDirectoryName(selectedTarget)
                     : selectedTarget;
 
-                // The dialog is the source of truth. When an existing .lnk is
-                // selected, AddLinkDialog resolves its target and arguments into
-                // the visible fields. Create the new shortcut from those values so
-                // the imported arguments are preserved and remain editable.
                 CreateShortcut(linkPath, target, arguments, workingDirectory,
                     dialog.IconPath, 0, name);
 
-                RefreshMenu();
+                // Only rebuild the currently displayed resident menu when that is
+                // the group we changed. Explorer invocations have no resident menu
+                // state in this process.
+                if (!String.IsNullOrWhiteSpace(Group) &&
+                    String.Equals(selectedGroup, Group, StringComparison.OrdinalIgnoreCase))
+                {
+                    RefreshMenu();
+                }
             }
             catch (Exception ex) { Error("Could not add link.", ex); }
         }
@@ -1755,19 +1852,34 @@ internal static class Program
 
     private sealed class AddLinkDialog : Form
     {
+        private const string CreateGroupOption = "<Create New Group...>";
+
         private readonly TextBox target = new TextBox();
         private readonly TextBox arguments = new TextBox();
         private readonly TextBox name = new TextBox();
         private readonly TextBox icon = new TextBox();
+        private readonly ComboBox group = new ComboBox();
         private string selectedShortcut = "";
+        private bool populatingGroups;
+        private string lastSelectedGroup = "";
 
         public string SelectedShortcut { get { return selectedShortcut; } }
         public string TargetPath { get { return target.Text; } }
         public string Arguments { get { return arguments.Text; } }
         public string LinkName { get { return name.Text; } }
-        public string IconPath { get { return icon.Text; } }
+        public string IconPath { get { return icon.Text == "(Default)" ? "" : icon.Text; } }
+        public string SelectedGroup
+        {
+            get
+            {
+                string value = group.SelectedItem as string;
+                return String.Equals(value, CreateGroupOption, StringComparison.Ordinal)
+                    ? ""
+                    : (value ?? "");
+            }
+        }
 
-        public AddLinkDialog()
+        public AddLinkDialog(string initialTarget, string initialGroup)
         {
             Text = "Add Link";
             FormBorderStyle = FormBorderStyle.FixedDialog;
@@ -1775,7 +1887,7 @@ internal static class Program
             MaximizeBox = false;
             MinimizeBox = false;
             ShowInTaskbar = false;
-            ClientSize = new Size(590, 204);
+            ClientSize = new Size(590, 242);
 
             AddLabel("Target:", 12, 18);
             target.SetBounds(82, 15, 405, 23);
@@ -1795,14 +1907,28 @@ internal static class Program
             var browseIcon = new Button { Text = "Browse..." };
             browseIcon.SetBounds(495, 128, 82, 25);
 
-            var add = new Button { Text = "Add", DialogResult = DialogResult.OK };
-            add.SetBounds(405, 167, 82, 27);
-            var cancel = new Button { Text = "Cancel", DialogResult = DialogResult.Cancel };
-            cancel.SetBounds(495, 167, 82, 27);
+            AddLabel("Group:", 12, 170);
+            group.SetBounds(82, 167, 495, 23);
+            group.DropDownStyle = ComboBoxStyle.DropDownList;
 
-            Controls.AddRange(new Control[] { target, arguments, name, icon, browseTarget, browseIcon, add, cancel });
+            var add = new Button { Text = "Add", DialogResult = DialogResult.OK };
+            add.SetBounds(405, 205, 82, 27);
+            var cancel = new Button { Text = "Cancel", DialogResult = DialogResult.Cancel };
+            cancel.SetBounds(495, 205, 82, 27);
+
+            Controls.AddRange(new Control[]
+            {
+                target, arguments, name, icon, group,
+                browseTarget, browseIcon, add, cancel
+            });
             AcceptButton = add;
             CancelButton = cancel;
+
+            PopulateGroups(initialGroup);
+            lastSelectedGroup = SelectedGroup;
+
+            if (!String.IsNullOrWhiteSpace(initialTarget))
+                SetTargetFromSelection(initialTarget, true);
 
             browseTarget.Click += delegate
             {
@@ -1814,53 +1940,7 @@ internal static class Program
                 })
                 {
                     if (ofd.ShowDialog(this) == DialogResult.OK)
-                    {
-                        string selected = ofd.FileName;
-
-                        if (Path.GetExtension(selected).Equals(".lnk", StringComparison.OrdinalIgnoreCase))
-                        {
-                            string resolvedTarget, resolvedArguments, resolvedIcon;
-                            if (!TryResolveShortcut(selected,
-                                out resolvedTarget, out resolvedArguments, out resolvedIcon))
-                            {
-                                MessageBox.Show(this,
-                                    "Could not read the selected shortcut.",
-                                    "Add Link",
-                                    MessageBoxButtons.OK,
-                                    MessageBoxIcon.Error);
-                                return;
-                            }
-
-                            target.Text = resolvedTarget;
-                            arguments.Text = resolvedArguments;
-
-                            // Preserve the existing shortcut icon when it explicitly
-                            // defines one. Otherwise leave "(Default)" so Windows
-                            // uses the target application's normal icon.
-                            string iconFile;
-                            int iconIndex;
-                            ParseIconLocation(resolvedIcon, out iconFile, out iconIndex);
-                            icon.Text = String.IsNullOrWhiteSpace(iconFile)
-                                ? "(Default)"
-                                : iconFile;
-                        }
-                        else if (Path.GetExtension(selected).Equals(".ps1", StringComparison.OrdinalIgnoreCase))
-                        {
-                            // A PowerShell script is an argument to the PowerShell host,
-                            // not an executable target. Show that transformation in the UI
-                            // so the user can see and edit exactly what the shortcut will run.
-                            target.Text = FindPowerShellHost();
-                            arguments.Text = BuildVisiblePowerShellArguments(selected, arguments.Text);
-                        }
-                        else
-                        {
-                            target.Text = selected;
-                            arguments.Text = "";
-                        }
-
-                        if (String.IsNullOrWhiteSpace(name.Text))
-                            name.Text = Path.GetFileNameWithoutExtension(selected);
-                    }
+                        SetTargetFromSelection(ofd.FileName, false);
                 }
             };
 
@@ -1877,6 +1957,34 @@ internal static class Program
                 }
             };
 
+            group.SelectedIndexChanged += delegate
+            {
+                if (populatingGroups) return;
+
+                string selected = group.SelectedItem as string;
+                if (!String.Equals(selected, CreateGroupOption, StringComparison.Ordinal))
+                {
+                    lastSelectedGroup = selected ?? "";
+                    return;
+                }
+
+                // ShowDialog(this) makes New Group modal to this Add Link dialog,
+                // so the underlying fields cannot be changed until creation is
+                // completed or cancelled.
+                string createdGroup;
+                if (CreateNewGroup(this, out createdGroup))
+                {
+                    PopulateGroups(createdGroup);
+                    lastSelectedGroup = createdGroup;
+                }
+                else
+                {
+                    // Restore exactly the valid selection that existed before the
+                    // transient "Create New Group" command was chosen.
+                    PopulateGroups(lastSelectedGroup);
+                }
+            };
+
             add.Click += delegate
             {
                 if (String.IsNullOrWhiteSpace(target.Text))
@@ -1884,8 +1992,108 @@ internal static class Program
                     MessageBox.Show(this, "Choose a target.", "Add Link",
                         MessageBoxButtons.OK, MessageBoxIcon.Information);
                     DialogResult = DialogResult.None;
+                    return;
+                }
+
+                if (String.IsNullOrWhiteSpace(SelectedGroup))
+                {
+                    MessageBox.Show(this, "Choose a group.", "Add Link",
+                        MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    DialogResult = DialogResult.None;
                 }
             };
+        }
+
+        private void PopulateGroups(string selectGroup)
+        {
+            string previous = selectGroup;
+            if (previous == null)
+                previous = SelectedGroup;
+
+            populatingGroups = true;
+            try
+            {
+                group.Items.Clear();
+
+                if (Directory.Exists(GroupsRoot))
+                {
+                    string[] directories = Directory.GetDirectories(GroupsRoot);
+                    Array.Sort(directories, StringComparer.CurrentCultureIgnoreCase);
+
+                    foreach (string directory in directories)
+                        group.Items.Add(Path.GetFileName(directory));
+                }
+
+                group.Items.Add(CreateGroupOption);
+                group.SelectedIndex = -1;
+
+                if (!String.IsNullOrWhiteSpace(previous))
+                {
+                    for (int i = 0; i < group.Items.Count; i++)
+                    {
+                        string item = group.Items[i] as string;
+                        if (String.Equals(item, previous, StringComparison.OrdinalIgnoreCase))
+                        {
+                            group.SelectedIndex = i;
+                            break;
+                        }
+                    }
+                }
+            }
+            finally
+            {
+                populatingGroups = false;
+            }
+        }
+
+        private void SetTargetFromSelection(string selected, bool forceName)
+        {
+            if (String.IsNullOrWhiteSpace(selected))
+                return;
+
+            selectedShortcut = "";
+
+            if (Path.GetExtension(selected).Equals(".lnk", StringComparison.OrdinalIgnoreCase))
+            {
+                string resolvedTarget, resolvedArguments, resolvedIcon;
+                if (!TryResolveShortcut(selected,
+                    out resolvedTarget, out resolvedArguments, out resolvedIcon))
+                {
+                    MessageBox.Show(this,
+                        "Could not read the selected shortcut.",
+                        "Add Link",
+                        MessageBoxButtons.OK,
+                        MessageBoxIcon.Error);
+                    return;
+                }
+
+                selectedShortcut = selected;
+                target.Text = resolvedTarget;
+                arguments.Text = resolvedArguments;
+
+                string iconFile;
+                int iconIndex;
+                ParseIconLocation(resolvedIcon, out iconFile, out iconIndex);
+                icon.Text = String.IsNullOrWhiteSpace(iconFile)
+                    ? "(Default)"
+                    : iconFile;
+            }
+            else if (Path.GetExtension(selected).Equals(".ps1", StringComparison.OrdinalIgnoreCase))
+            {
+                target.Text = FindPowerShellHost();
+                arguments.Text = BuildVisiblePowerShellArguments(selected, arguments.Text);
+            }
+            else
+            {
+                target.Text = selected;
+                arguments.Text = "";
+            }
+
+            if (forceName || String.IsNullOrWhiteSpace(name.Text))
+            {
+                string trimmed = selected.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+                name.Text = Path.GetFileNameWithoutExtension(trimmed);
+            }
         }
 
         private void AddLabel(string text, int x, int y)
@@ -1895,6 +2103,7 @@ internal static class Program
             Controls.Add(label);
         }
     }
+
 
     // ---------- Shortcut editing / properties ----------
 
@@ -2299,14 +2508,33 @@ internal static class Program
 
     private static void NewGroup()
     {
+        string createdGroup;
+        if (!CreateNewGroup(HostForm, out createdGroup))
+            return;
+
+        MessageBox.Show(
+            "Created group \"" + createdGroup + "\" and pinned it to the taskbar.",
+            "Taskbar Groups", MessageBoxButtons.OK, MessageBoxIcon.Information);
+    }
+
+    private static bool CreateNewGroup(IWin32Window owner, out string createdGroup)
+    {
+        createdGroup = null;
+
         using (var dialog = new NewGroupDialog())
         {
-            if (dialog.ShowDialog() != DialogResult.OK) return;
+            DialogResult result = owner == null
+                ? dialog.ShowDialog()
+                : dialog.ShowDialog(owner);
+
+            if (result != DialogResult.OK)
+                return false;
 
             try
             {
                 string name = SanitizeFileName(dialog.GroupName.Trim());
-                if (name.Length == 0) return;
+                if (name.Length == 0)
+                    throw new InvalidOperationException("Enter a group name.");
 
                 string folder = Path.Combine(GroupsRoot, name);
                 if (Directory.Exists(folder))
@@ -2314,7 +2542,7 @@ internal static class Program
 
                 Directory.CreateDirectory(folder);
                 Directory.CreateDirectory(PinRoot);
-        Directory.CreateDirectory(IconCacheRoot);
+                Directory.CreateDirectory(IconCacheRoot);
 
                 string icon = dialog.IconPath;
                 if (String.IsNullOrWhiteSpace(icon))
@@ -2333,14 +2561,18 @@ internal static class Program
                 string shortcut = Path.Combine(PinRoot, name + ".lnk");
                 CreateShortcut(shortcut, ExePath, Quote(name), AppRoot, icon, 0, name);
 
-                Process.Start("explorer.exe", "/select," + Quote(shortcut));
+                if (!PinGroupToTaskbar(name))
+                    throw new InvalidOperationException(
+                        "The group was created, but Windows did not expose the taskbar pin command.");
 
-                MessageBox.Show(
-                    "Created group \"" + name + "\".\r\n\r\n" +
-                    "Its shortcut is selected in \"Pin to Taskbar\". Pin it normally when you're ready.",
-                    "Taskbar Groups", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                createdGroup = name;
+                return true;
             }
-            catch (Exception ex) { Error("Could not create group.", ex); }
+            catch (Exception ex)
+            {
+                Error("Could not create group.", ex);
+                return false;
+            }
         }
     }
 
@@ -2476,7 +2708,8 @@ internal static class Program
     {
         DialogResult r = MessageBox.Show(
             "Delete group \"" + Group + "\"?\r\n\r\n" +
-            "This deletes the group folder and its group items, and removes its shortcut from \"Pin to Taskbar\".\r\n\r\n" +
+            "This deletes the group folder and its group items, unpins the group from the taskbar, " +
+            "and removes its shortcut from \"Pin to Taskbar\".\r\n\r\n" +
             "Programs and files targeted by the shortcuts are not deleted.",
             "Taskbar Groups", MessageBoxButtons.YesNo, MessageBoxIcon.Warning,
             MessageBoxDefaultButton.Button2);
@@ -2486,6 +2719,11 @@ internal static class Program
         try
         {
             string pin = Path.Combine(PinRoot, Group + ".lnk");
+
+            // Unpin while the source shortcut still exists so Explorer can resolve
+            // the pinned item's identity cleanly.
+            UnpinGroupFromTaskbar(Group);
+
             Directory.Delete(GroupFolder, true);
             if (File.Exists(pin)) File.Delete(pin);
             CloseMenu(false);
@@ -2493,7 +2731,395 @@ internal static class Program
         catch (Exception ex) { Error("Could not delete group.", ex); }
     }
 
-    // ---------- Launch / shell / icons ----------
+    private static void UnpinCurrentGroup()
+    {
+        try
+        {
+            if (!UnpinGroupFromTaskbar(Group))
+            {
+                MessageBox.Show(
+                    "Windows did not expose an Unpin from taskbar command for this group.",
+                    "Taskbar Groups", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+
+            CloseMenu(false);
+        }
+        catch (Exception ex)
+        {
+            Error("Could not unpin group from the taskbar.", ex);
+        }
+    }
+
+    private static bool PinGroupToTaskbar(string groupName)
+    {
+        string shortcut = Path.Combine(PinRoot, groupName + ".lnk");
+        string pinnedShortcut = GetPinnedTaskbarShortcut(groupName);
+
+        if (File.Exists(pinnedShortcut))
+            return true;
+
+        // Windows 10 RS5+ uses the taskband's IPinnedList3 interface. This is
+        // the same mechanism Chromium uses because Microsoft disabled the old
+        // automatable "taskbarpin" shell verb on Windows 10.
+        // A successful IPinnedList3::Modify means Windows accepted the pin
+        // request. On builds that show the Windows confirmation UI, completion
+        // is asynchronous and depends on the user; do not block this dialog or
+        // misreport a timeout as failure while Windows is waiting for input.
+        if (PinShortcutWithPinnedList(shortcut))
+            return true;
+
+        // Older Windows builds may still expose one of the legacy mechanisms.
+        if (InvokeNamedShellVerb(shortcut, "Pin to taskbar") &&
+            WaitForFileState(pinnedShortcut, true, 2000))
+            return true;
+
+        if (InvokeShellVerb(shortcut, "taskbarpin") &&
+            WaitForFileState(pinnedShortcut, true, 2000))
+            return true;
+
+        LogInfo("Taskbar pin was not confirmed: " + shortcut);
+        return false;
+    }
+
+    private static bool PinShortcutWithPinnedList(string shortcut)
+    {
+        object comObject = null;
+        IntPtr pidl = IntPtr.Zero;
+
+        try
+        {
+            if (String.IsNullOrWhiteSpace(shortcut) || !File.Exists(shortcut))
+                return false;
+
+            Type taskbandType = Type.GetTypeFromCLSID(
+                new Guid("90AA3A4E-1CBA-4233-B8BB-535773D48449"), false);
+            if (taskbandType == null)
+                return false;
+
+            comObject = Activator.CreateInstance(taskbandType);
+            IPinnedList3 pinnedList = comObject as IPinnedList3;
+            if (pinnedList == null)
+                return false;
+
+            pidl = ILCreateFromPath(shortcut);
+            if (pidl == IntPtr.Zero)
+                return false;
+
+            // PinnedListModifyCaller::kExplorer = 4.
+            int hr = pinnedList.Modify(IntPtr.Zero, pidl, 4);
+            LogInfo("IPinnedList3 taskbar pin request result: 0x" + hr.ToString("X8") + " -> " + shortcut);
+            return hr >= 0;
+        }
+        catch (Exception ex)
+        {
+            LogError("IPinnedList3 taskbar pin failed: " + shortcut, ex);
+            return false;
+        }
+        finally
+        {
+            if (pidl != IntPtr.Zero)
+                ILFree(pidl);
+
+            if (comObject != null && Marshal.IsComObject(comObject))
+                Marshal.FinalReleaseComObject(comObject);
+        }
+    }
+
+    private static string GetPinnedTaskbarShortcut(string groupName)
+    {
+        return Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+            "Microsoft", "Internet Explorer", "Quick Launch", "User Pinned", "TaskBar",
+            groupName + ".lnk");
+    }
+
+    private static bool WaitForFileState(string path, bool shouldExist, int timeoutMs)
+    {
+        int elapsed = 0;
+        while (elapsed <= timeoutMs)
+        {
+            if (File.Exists(path) == shouldExist)
+                return true;
+
+            Thread.Sleep(50);
+            elapsed += 50;
+        }
+
+        return false;
+    }
+
+    private static bool InvokeNamedShellVerb(string path, string displayName)
+    {
+        if (String.IsNullOrWhiteSpace(path) || !File.Exists(path))
+            return false;
+
+        object shell = null;
+        object folder = null;
+        object item = null;
+        object verbs = null;
+        object verb = null;
+
+        try
+        {
+            Type shellType = Type.GetTypeFromProgID("Shell.Application");
+            if (shellType == null) return false;
+
+            shell = Activator.CreateInstance(shellType);
+            folder = shellType.InvokeMember(
+                "NameSpace", BindingFlags.InvokeMethod, null, shell,
+                new object[] { Path.GetDirectoryName(path) });
+            if (folder == null) return false;
+
+            item = folder.GetType().InvokeMember(
+                "ParseName", BindingFlags.InvokeMethod, null, folder,
+                new object[] { Path.GetFileName(path) });
+            if (item == null) return false;
+
+            verbs = item.GetType().InvokeMember(
+                "Verbs", BindingFlags.InvokeMethod, null, item, null);
+            if (verbs == null) return false;
+
+            int count = Convert.ToInt32(verbs.GetType().InvokeMember(
+                "Count", BindingFlags.GetProperty, null, verbs, null));
+
+            for (int i = 0; i < count; i++)
+            {
+                verb = verbs.GetType().InvokeMember(
+                    "Item", BindingFlags.InvokeMethod, null, verbs,
+                    new object[] { i });
+
+                if (verb == null) continue;
+
+                string name = Convert.ToString(verb.GetType().InvokeMember(
+                    "Name", BindingFlags.GetProperty, null, verb, null));
+
+                string normalized = (name ?? "").Replace("&", "").Trim();
+                if (String.Equals(normalized, displayName, StringComparison.OrdinalIgnoreCase))
+                {
+                    verb.GetType().InvokeMember(
+                        "DoIt", BindingFlags.InvokeMethod, null, verb, null);
+                    LogInfo("Explorer named shell verb invoked: " + name + " -> " + path);
+                    return true;
+                }
+
+                if (Marshal.IsComObject(verb)) Marshal.FinalReleaseComObject(verb);
+                verb = null;
+            }
+
+            LogInfo("Explorer named shell verb not found: " + displayName + " -> " + path);
+            return false;
+        }
+        catch (Exception ex)
+        {
+            LogError("Explorer named shell verb failed: " + displayName + " -> " + path, ex);
+            return false;
+        }
+        finally
+        {
+            if (verb != null && Marshal.IsComObject(verb)) Marshal.FinalReleaseComObject(verb);
+            if (verbs != null && Marshal.IsComObject(verbs)) Marshal.FinalReleaseComObject(verbs);
+            if (item != null && Marshal.IsComObject(item)) Marshal.FinalReleaseComObject(item);
+            if (folder != null && Marshal.IsComObject(folder)) Marshal.FinalReleaseComObject(folder);
+            if (shell != null && Marshal.IsComObject(shell)) Marshal.FinalReleaseComObject(shell);
+        }
+    }
+
+    private static bool UnpinGroupFromTaskbar(string groupName)
+    {
+        string pinnedShortcut = GetPinnedTaskbarShortcut(groupName);
+
+        // Prefer the actual pinned copy. Fall back to the source shortcut because
+        // Explorer can expose the unpin verb there on Windows 10 as well.
+        if (File.Exists(pinnedShortcut) && InvokeShellVerb(pinnedShortcut, "taskbarunpin"))
+            return true;
+
+        string sourceShortcut = Path.Combine(PinRoot, groupName + ".lnk");
+        return File.Exists(sourceShortcut) &&
+            InvokeShellVerb(sourceShortcut, "taskbarunpin");
+    }
+
+    private static bool InvokeShellVerb(string path, string canonicalVerb)
+    {
+        if (String.IsNullOrWhiteSpace(path) || !File.Exists(path))
+            return false;
+
+        object shell = null;
+        object folder = null;
+        object item = null;
+
+        try
+        {
+            Type shellType = Type.GetTypeFromProgID("Shell.Application");
+            if (shellType == null) return false;
+
+            shell = Activator.CreateInstance(shellType);
+            string directory = Path.GetDirectoryName(path);
+            string fileName = Path.GetFileName(path);
+
+            folder = shellType.InvokeMember(
+                "NameSpace",
+                BindingFlags.InvokeMethod,
+                null,
+                shell,
+                new object[] { directory });
+
+            if (folder == null) return false;
+
+            item = folder.GetType().InvokeMember(
+                "ParseName",
+                BindingFlags.InvokeMethod,
+                null,
+                folder,
+                new object[] { fileName });
+
+            if (item == null) return false;
+
+            item.GetType().InvokeMember(
+                "InvokeVerb",
+                BindingFlags.InvokeMethod,
+                null,
+                item,
+                new object[] { canonicalVerb });
+
+            LogInfo("Explorer shell verb invoked: " + canonicalVerb + " -> " + path);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            LogError("Explorer shell verb failed: " + canonicalVerb + " -> " + path, ex);
+            return false;
+        }
+        finally
+        {
+            if (item != null && Marshal.IsComObject(item)) Marshal.FinalReleaseComObject(item);
+            if (folder != null && Marshal.IsComObject(folder)) Marshal.FinalReleaseComObject(folder);
+            if (shell != null && Marshal.IsComObject(shell)) Marshal.FinalReleaseComObject(shell);
+        }
+    }
+
+    private static void ShowMissingGroupDialog(string groupName, string groupFolder)
+    {
+        using (Form dialog = new Form())
+        {
+            dialog.Text = "Taskbar Groups";
+            dialog.StartPosition = FormStartPosition.CenterScreen;
+            dialog.FormBorderStyle = FormBorderStyle.FixedDialog;
+            dialog.MaximizeBox = false;
+            dialog.MinimizeBox = false;
+            dialog.ShowInTaskbar = false;
+            dialog.TopMost = true;
+            dialog.ClientSize = new Size(540, 174);
+
+            Label message = new Label
+            {
+                AutoSize = false,
+                Left = 18,
+                Top = 18,
+                Width = 504,
+                Height = 78,
+                Text = "Taskbar group folder does not exist:\r\n" + groupFolder +
+                       "\r\n\r\nRecreate the empty group, unpin it from the taskbar, or cancel."
+            };
+
+            Button recreate = new Button
+            {
+                Text = "Recreate Group",
+                Width = 112,
+                Height = 28,
+                Left = 174,
+                Top = 124
+            };
+
+            Button unpin = new Button
+            {
+                Text = "Unpin from Taskbar",
+                Width = 130,
+                Height = 28,
+                Left = 294,
+                Top = 124
+            };
+
+            Button cancel = new Button
+            {
+                Text = "Cancel",
+                Width = 90,
+                Height = 28,
+                Left = 432,
+                Top = 124,
+                DialogResult = DialogResult.Cancel
+            };
+
+            recreate.Click += delegate
+            {
+                try
+                {
+                    Directory.CreateDirectory(groupFolder);
+
+                    // The taskbar shortcut already exists in this recovery case.
+                    // Restore the backing group only; do not generate another
+                    // shortcut or submit another Windows pin request.
+                    InvalidateGroupMenuCache(groupName);
+                    LogInfo("Recreated missing group folder: " + groupFolder);
+                    dialog.DialogResult = DialogResult.OK;
+                    dialog.Close();
+                }
+                catch (Exception ex)
+                {
+                    LogError("Failed to recreate missing group folder: " + groupFolder, ex);
+                    MessageBox.Show(
+                        dialog,
+                        "Could not recreate the group.\r\n\r\n" + ex.Message,
+                        "Taskbar Groups",
+                        MessageBoxButtons.OK,
+                        MessageBoxIcon.Error);
+                }
+            };
+
+            unpin.Click += delegate
+            {
+                if (UnpinGroupFromTaskbar(groupName))
+                {
+                    LogInfo("Unpinned stale taskbar group: " + groupName);
+                    dialog.DialogResult = DialogResult.OK;
+                    dialog.Close();
+                }
+                else
+                {
+                    MessageBox.Show(
+                        dialog,
+                        "Windows did not confirm that the group was unpinned.",
+                        "Taskbar Groups",
+                        MessageBoxButtons.OK,
+                        MessageBoxIcon.Warning);
+                }
+            };
+
+            dialog.Controls.AddRange(new Control[] { message, recreate, unpin, cancel });
+            dialog.AcceptButton = recreate;
+            dialog.CancelButton = cancel;
+
+            // This request usually arrives through the resident background
+            // process. Own the dialog with its persistent host and explicitly
+            // activate it so an orphaned pinned shortcut cannot appear to do
+            // nothing because the warning opened behind another application.
+            Form owner = HostForm;
+            if (owner != null && !owner.IsDisposed)
+            {
+                try { owner.Activate(); } catch { }
+                dialog.Shown += delegate
+                {
+                    dialog.Activate();
+                    dialog.BringToFront();
+                };
+                dialog.ShowDialog(owner);
+            }
+            else
+            {
+                dialog.ShowDialog();
+            }
+        }
+    }
 
     private static void Launch(string path)
     {

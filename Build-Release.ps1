@@ -35,7 +35,13 @@ if (-not $csc) {
     throw 'Built-in .NET Framework C# compiler not found.'
 }
 
+$AppIcon = Join-Path $Root 'assets\TaskbarGroups.ico'
+if (-not (Test-Path -LiteralPath $AppIcon -PathType Leaf)) {
+    throw "Application icon was not found: $AppIcon"
+}
+
 & $csc /nologo /target:winexe /optimize+ `
+    /win32icon:"$AppIcon" `
     /reference:System.dll `
     /reference:System.Drawing.dll `
     /reference:System.Windows.Forms.dll `
@@ -118,15 +124,38 @@ Write-Host "  $setup"
 Write-Host ''
 Write-Host "Installing Taskbar Groups $Version..."
 
+$installLog = Join-Path $ReleaseRoot ("Taskbar-Groups-Setup-v{0}-install.log" -f $Version)
+Remove-Item -LiteralPath $installLog -Force -ErrorAction SilentlyContinue
+
+# Inno Setup exit code 5 means the user cancelled Setup. Do not suppress setup
+# message boxes while diagnosing/installing: doing so can turn an actionable
+# file/registry error into a bare cancellation exit code with no visible cause.
+$installArguments = '/VERYSILENT /NORESTART /LOG="' + $installLog + '"'
+
 $installProcess = Start-Process `
     -FilePath $setup `
-    -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART' `
+    -ArgumentList $installArguments `
     -Verb RunAs `
     -Wait `
     -PassThru
 
 if ($installProcess.ExitCode -ne 0) {
-    throw "Installer failed with exit code $($installProcess.ExitCode)."
+    Write-Host ''
+    Write-Host "Installer log:"
+    Write-Host "  $installLog"
+
+    if (-not [String]::IsNullOrWhiteSpace($installLog) -and
+        (Test-Path -LiteralPath $installLog -PathType Leaf)) {
+        Write-Host ''
+        Write-Host 'Last 40 installer log lines:'
+        Get-Content -LiteralPath $installLog -Tail 40
+    }
+
+    if ($installProcess.ExitCode -eq 5) {
+        throw "Installer was cancelled (Inno Setup exit code 5). Review the installer log above for the operation that caused Setup to abort."
+    }
+
+    throw "Installer failed with exit code $($installProcess.ExitCode). Review: $installLog"
 }
 
 Write-Host ''

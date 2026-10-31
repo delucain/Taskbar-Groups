@@ -25,20 +25,36 @@ Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
 UninstallDisplayIcon={app}\{#MyAppExeName}
+SetupIconFile=..\assets\TaskbarGroups.ico
 VersionInfoVersion={#MyAppVersion}
 VersionInfoProductName={#MyAppName}
 VersionInfoProductVersion={#MyAppVersion}
 
 [Files]
 Source: "..\Taskbar-GroupMenu.exe"; DestDir: "{app}"; Flags: ignoreversion
-Source: "..\Icon Library\*"; DestDir: "{app}\Icon Library"; Flags: ignoreversion recursesubdirs createallsubdirs
+; The Icon Library is seeded by Setup but becomes user-owned mutable content.
+; Never overwrite an existing icon during upgrades and never remove seeded or
+; user-added icons during uninstall.
+Source: "..\Icon Library\*"; DestDir: "{app}\Icon Library"; Flags: ignoreversion recursesubdirs createallsubdirs onlyifdoesntexist uninsneveruninstall
 Source: "..\_templates\*"; DestDir: "{app}\_templates"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "..\assets\TaskbarGroups.ico"; DestDir: "{app}\assets"; Flags: ignoreversion
 
 
 [Registry]
 ; Start one resident menu host per interactive session at logon. The host warms
 ; all group/menu/icon caches before the user clicks a taskbar group.
 Root: HKLM; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "TaskbarGroupsMenuHost"; ValueData: """{app}\{#MyAppExeName}"" --resident-host"; Flags: uninsdeletevalue
+
+; Explorer integration for selected files and directories.
+; Use the installed executable rather than the resident host directly; this
+; invocation opens a standalone Add Link dialog with no group preselected.
+Root: HKCR; Subkey: "*\shell\TaskbarGroupsPin"; ValueType: string; ValueData: "Pin to Taskbar Group"; Flags: uninsdeletekey
+Root: HKCR; Subkey: "*\shell\TaskbarGroupsPin"; ValueName: "Icon"; ValueType: string; ValueData: "{app}\assets\TaskbarGroups.ico"
+Root: HKCR; Subkey: "*\shell\TaskbarGroupsPin\command"; ValueType: string; ValueData: """{app}\{#MyAppExeName}"" --pin-to-group ""%1"""
+
+Root: HKCR; Subkey: "Directory\shell\TaskbarGroupsPin"; ValueType: string; ValueData: "Pin to Taskbar Group"; Flags: uninsdeletekey
+Root: HKCR; Subkey: "Directory\shell\TaskbarGroupsPin"; ValueName: "Icon"; ValueType: string; ValueData: "{app}\assets\TaskbarGroups.ico"
+Root: HKCR; Subkey: "Directory\shell\TaskbarGroupsPin\command"; ValueType: string; ValueData: """{app}\{#MyAppExeName}"" --pin-to-group ""%1"""
 
 [UninstallDelete]
 ; User data is intentionally not deleted. It lives under the user's

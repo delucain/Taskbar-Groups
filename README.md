@@ -1,50 +1,32 @@
 # Taskbar Groups
 
-Taskbar Groups is a lightweight Windows 10 taskbar launcher for user-defined popup groups. Each group is represented by a normal Windows shortcut that can be pinned to the taskbar. Clicking the shortcut asks a small resident host to display the group's menu adjacent to the taskbar click.
+Taskbar Groups is a lightweight Windows 10 taskbar launcher for user-defined popup groups. Each group is represented by a Windows shortcut pinned to the taskbar. Clicking it asks a small resident host to display the group's menu adjacent to the original taskbar click.
 
 The project is deliberately filesystem-driven. Groups, shortcuts, headings, separators, ordering, and icons are ordinary files rather than records in a configuration database.
-
-> **1.0.3 status:** the repository is currently at a known-good pre-release baseline. The persistent host, startup prewarm, menu/icon caches, taskbar positioning, and same-user IPC path are working. One additional feature is planned before the final 1.0.3 release.
-
-## Screenshots
-
-### Group menu
-
-![Taskbar Groups Utilities menu](docs/screenshots/group-menu.png)
-
-### Adding links
-
-![Add Link dialog](docs/screenshots/add-link.png)
-
-### Creating groups
-
-![New Group dialog](docs/screenshots/new-group.png)
-
-### Included icon library
-
-![Bordered group icons](docs/screenshots/group-icon-library.png)
-
-![Standard icons](docs/screenshots/standard-icon-library.png)
 
 ## Features
 
 - Multiple independent taskbar groups.
-- Normal Windows shortcuts that can be pinned to the taskbar.
 - Persistent per-user menu host for low-latency menu opening.
 - Startup prewarming of group menus and icon caches.
 - In-memory caching of complete `ToolStripItem` menu hierarchies.
 - Persistent rendered-icon cache under `%LOCALAPPDATA%\Taskbar-Groups\Cache\MenuIcons`.
-- Taskbar-relative menu placement based on the resident host's low-level mouse-down capture and taskbar geometry, so moving the mouse after clicking does not move the popup.
+- Taskbar-relative menu placement based on the original low-level mouse-down location.
+- Automatic taskbar pin request when a group is created.
+- Group commands to unpin or delete a group; deletion unpins first.
+- Recovery dialog for stale taskbar pins whose group folder is missing, with **Recreate Group**, **Unpin from Taskbar**, and **Cancel**.
+- Explorer **Pin to Taskbar Group** context-menu command for files and directories.
+- Add Link dialog with explicit group selection and inline **<Create New Group...>** support.
 - Supports `.lnk`, `.url`, `.exe`, `.bat`, `.cmd`, and `.ps1` launch items.
 - PowerShell 7 is preferred for `.ps1` shortcuts when available; Windows PowerShell 5.1 is the fallback.
-- Command-line arguments for created shortcuts.
+- Existing command-line arguments are preserved when creating PowerShell links while ensuring the selected script remains the `-File` target.
 - Section headings and separators.
 - Drag-and-drop ordering with normalized numeric prefixes (`010`, `020`, `030`, ...).
 - Per-item commands for moving, inserting, renaming, changing icons, removing items, opening file locations, and opening native Windows property dialogs.
-- Group commands for adding items, renaming groups, changing group icons, creating groups, and deleting groups.
 - Dark/light appearance follows the Windows app theme.
-- Standard and bordered icon libraries included.
-- No third-party runtime is required by the launcher.
+- Starter icon library that users may extend or customize without upgrades overwriting their files.
+- Dedicated application/Explorer context-menu icon.
+- No third-party runtime required by the launcher.
 
 ## How it works
 
@@ -60,18 +42,18 @@ At logon, the installer registers:
 Taskbar-GroupMenu.exe --resident-host
 ```
 
-The resident host initializes WinForms once, starts the menu IPC endpoint, prewarms all groups, and remains idle. A later taskbar click starts a short-lived launcher process which forwards the requested group over a same-user named pipe and exits. The resident process then attaches the cached menu hierarchy and displays it.
+The resident host initializes WinForms once, starts the menu IPC endpoint, prewarms configured groups, and remains idle. A later taskbar click starts a short-lived launcher process which forwards the requested group over a same-user named pipe and exits. The resident process validates the group, attaches its cached menu hierarchy, and displays it.
 
-The host is isolated by both Windows session ID and user SID. The named pipe also has an explicit ACL granting the current user access. This prevents cross-user/session collisions while allowing normal taskbar-launched clients to communicate with the resident host.
+The host is isolated by Windows session ID and user SID. The named pipe also has an explicit ACL granting the current user access.
 
 See [Architecture](docs/ARCHITECTURE.md) for details.
 
 ## Installation
 
-Download and run the release installer:
+Download and run:
 
 ```text
-Taskbar-Groups-Setup-vX.Y.Z.exe
+Taskbar-Groups-Setup-v1.0.3.exe
 ```
 
 Application files are installed under:
@@ -79,11 +61,12 @@ Application files are installed under:
 ```text
 C:\Program Files\Taskbar Groups\
 ├── Taskbar-GroupMenu.exe
+├── assets\
 ├── Icon Library\
 └── _templates\
 ```
 
-Per-user state lives separately under:
+Per-user state lives under:
 
 ```text
 %LOCALAPPDATA%\Taskbar-Groups\
@@ -95,25 +78,33 @@ Per-user state lives separately under:
     └── MenuIcons\
 ```
 
-User data is intentionally preserved during uninstall and upgrade.
+User group data is preserved during upgrades and uninstall. The installed `Icon Library` is also preserved because it becomes user-owned mutable content after Setup seeds it.
 
-## Creating and pinning a group
+## Creating a group
 
-From any existing group, choose:
+From an existing group choose:
 
 ```text
 Group Options
 └── New Group
 ```
 
-Creating a group:
+Creation:
 
 1. Creates `%LOCALAPPDATA%\Taskbar-Groups\Groups\<Group Name>\`.
 2. Creates `%LOCALAPPDATA%\Taskbar-Groups\Pin to Taskbar\<Group Name>.lnk`.
-3. Configures that shortcut to launch `Taskbar-GroupMenu.exe "<Group Name>"`.
-4. Opens Explorer with the shortcut selected so it can be pinned normally.
+3. Configures the shortcut to launch `Taskbar-GroupMenu.exe "<Group Name>"`.
+4. Submits the native Windows taskbar-pin request. Windows may display its own confirmation prompt; Taskbar Groups does not block while that prompt is waiting for input.
 
-See the [User Guide](docs/USER-GUIDE.md) for item management, ordering, PowerShell links, headings, separators, and icons.
+If a pinned group shortcut survives after its group directory is manually removed, launching it opens a recovery dialog that can recreate the empty group or unpin the stale shortcut.
+
+## Adding items from Explorer
+
+Setup adds **Pin to Taskbar Group** to the Windows Explorer context menu for files and directories. It opens the normal Add Link dialog with the selected path populated.
+
+The **Group** field is required. The group list contains existing groups plus **<Create New Group...>**. Creating a group from this dialog refreshes the list and selects the new group.
+
+See the [User Guide](docs/USER-GUIDE.md) for complete item and group management behavior.
 
 ## Building from source
 
@@ -130,36 +121,25 @@ Build from the repository root:
 .\Build-Release.ps1 -Version 1.0.3
 ```
 
-The version argument is mandatory.
+The build script compiles the launcher with `assets\TaskbarGroups.ico`, builds the Inno Setup installer, installs it locally for testing, writes an installer log under `_release`, and restarts the resident host using the freshly built executable. It does not restart Explorer.
 
-The build script:
+See [Development](docs/DEVELOPMENT.md) for the release checklist.
 
-1. Stops any existing `Taskbar-GroupMenu` resident process.
-2. Compiles `Taskbar-GroupMenu.cs` into `Taskbar-GroupMenu.exe`.
-3. Removes Mark-of-the-Web metadata from the packaged payload.
-4. Builds `_release\Taskbar-Groups-Setup-v1.0.3.exe` with Inno Setup.
-5. Installs the release locally for testing.
-6. Stops any stale resident host left by installation/testing.
-7. Starts the freshly built host with `--resident-host` through the interactive Windows shell.
-8. Gives startup prewarming time to run before returning.
+## Logging and performance diagnostics
 
-See [Development](docs/DEVELOPMENT.md) for diagnostics and release workflow.
+Every resident host writes one session log under:
 
-## Performance diagnostics
+```text
+%LOCALAPPDATA%\Taskbar-Groups\TaskbarGroups_yyyyMMdd-HHmmss.log
+```
 
-Set the user environment variable below to enable timestamped performance logs:
+Normal lifecycle messages and errors are always logged. Enable detailed `PERF` records with:
 
 ```powershell
 [Environment]::SetEnvironmentVariable('TASKBAR_GROUPS_PERF', '1', 'User')
 ```
 
-New processes then write logs such as:
-
-```text
-%LOCALAPPDATA%\Taskbar-Groups\performance-20261031-153529-663-43880.log
-```
-
-Disable logging with:
+Restart the resident host after changing the variable. Disable detailed performance records with:
 
 ```powershell
 [Environment]::SetEnvironmentVariable('TASKBAR_GROUPS_PERF', $null, 'User')
@@ -176,6 +156,8 @@ Taskbar-Groups\
 ├── README.md
 ├── CHANGELOG.md
 ├── LICENSE
+├── assets\
+│   └── TaskbarGroups.ico
 ├── Icon Library\
 ├── _templates\
 ├── installer\
@@ -186,11 +168,10 @@ Taskbar-Groups\
     ├── DEVELOPMENT.md
     ├── PERFORMANCE.md
     ├── RELEASE-NOTES-1.0.3.md
-    ├── USER-GUIDE.md
-    └── screenshots\
+    └── USER-GUIDE.md
 ```
 
-`installer\Install-UserData.ps1` remains only to prevent older working trees from continuing to use the previous elevated per-user initialization behavior. Current application versions initialize their own `%LOCALAPPDATA%\Taskbar-Groups` state.
+`installer\Install-UserData.ps1` remains for compatibility with older working trees. Current versions initialize their own `%LOCALAPPDATA%\Taskbar-Groups` state.
 
 ## License
 

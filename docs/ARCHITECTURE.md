@@ -2,15 +2,14 @@
 
 ## Overview
 
-Taskbar Groups consists of one executable, `Taskbar-GroupMenu.exe`, used in several modes:
+Taskbar Groups uses one executable, `Taskbar-GroupMenu.exe`, in several modes:
 
 | Mode | Invocation | Purpose |
 |---|---|---|
-| Resident host | `Taskbar-GroupMenu.exe --resident-host` | Owns the WinForms host/menu, IPC server, taskbar click tracker, menu hierarchy cache, and in-memory icon cache. |
-| Taskbar launcher | `Taskbar-GroupMenu.exe "Group Name"` | Fast client. Forwards the requested group to the resident host and exits. |
-| Link Properties worker | `Taskbar-GroupMenu.exe --link-properties-worker "path.lnk"` | Keeps a message loop alive while the native Windows shortcut property sheet is open. |
-
-The same binary is used so installed group shortcuts remain simple and portable across upgrades.
+| Resident host | `Taskbar-GroupMenu.exe --resident-host` | Owns WinForms state, IPC server, taskbar click tracker, menu hierarchy cache, and in-memory icon cache. |
+| Taskbar launcher | `Taskbar-GroupMenu.exe "Group Name"` | Fast client that forwards a group request to the resident host and exits. |
+| Explorer Add Link | `Taskbar-GroupMenu.exe --pin-to-group "path"` | Opens Add Link for a file/directory selected through Explorer. |
+| Link Properties worker | `Taskbar-GroupMenu.exe --link-properties-worker "path.lnk"` | Keeps a message loop alive while the native shortcut property sheet is open. |
 
 ## Resident-host lifecycle
 
@@ -18,40 +17,37 @@ At Windows logon the installer-created Run entry starts `Taskbar-GroupMenu.exe -
 
 The host:
 
-1. Creates the per-user data directories.
+1. Creates per-user data directories.
 2. Attempts to contact an existing host.
 3. Uses a named mutex to elect a host if none responds.
-4. Initializes WinForms only in the process that becomes the host.
+4. Initializes WinForms only in the elected host.
 5. Creates the hidden owner form and reusable `ContextMenuStrip`.
-6. Installs the low-level mouse click tracker.
+6. Installs the low-level taskbar mouse tracker.
 7. Starts the named-pipe server.
-8. Queues prewarming of all configured groups.
+8. Queues incremental prewarming of configured groups.
 9. Enters the WinForms message loop.
 
-Prewarming is intentionally incremental: one group is prepared per UI-message-pump turn. A real menu request therefore takes priority over background warmup.
+A real menu request takes priority over background prewarming.
 
 ## IPC
 
-The host and launchers communicate through a local named pipe. IPC identity includes:
+The host and launchers communicate through a local named pipe. IPC identity includes the Windows session ID and current-user SID. The same suffix scopes the host mutex and pipe names.
 
-- Windows session ID.
-- Current user's SID.
+The server creates an explicit `PipeSecurity` descriptor granting the current user full control. The pipe is the authoritative liveness check; the mutex is host-election state, not proof of a functioning server.
 
-The same suffix is used for the host mutex and pipe names. This prevents unrelated users or sessions from colliding with one another.
+## Menu request path
 
-The pipe server creates an explicit `PipeSecurity` descriptor granting the current user full control. This is required because normal taskbar launchers must be able to reach the already-running resident host regardless of how the host was started during installation/testing.
+When the resident host receives a group request it first resolves `%LOCALAPPDATA%\Taskbar-Groups\Groups\<Group Name>` and verifies that the directory exists.
 
-The pipe is the authoritative liveness check. The mutex is used for host election, not as proof that a functioning IPC server exists.
+If it is missing, cached menu content is not used. The host displays an owned foreground recovery dialog that can recreate the empty group, unpin the stale taskbar shortcut, or cancel.
+
+If the group exists, its lightweight filesystem signature determines whether the cached `ToolStripItem[]` hierarchy can be reused.
 
 ## Menu hierarchy cache
 
-Each group has a cached `ToolStripItem[]` hierarchy in the resident process.
+Each group has a cached `ToolStripItem[]` hierarchy in the resident process. A signature derived from top-level filesystem entries determines whether it remains valid. Management operations explicitly invalidate affected groups.
 
-A lightweight signature derived from the group's top-level filesystem entries determines whether a cached hierarchy remains valid. On a cache hit, the hierarchy is reattached to the shared `ContextMenuStrip`; item construction and icon resolution are skipped.
-
-Management operations invalidate the affected group cache.
-
-When switching menus, old items are detached from the live `ContextMenuStrip` before disposal. Disposal is deferred until after the replacement menu paints so recursive WinForms cleanup does not sit on the menu-open critical path.
+When switching menus, old items are detached from the live `ContextMenuStrip` before disposal. Permanent disposal is deferred until after replacement content paints.
 
 ## Icon cache
 
@@ -60,19 +56,33 @@ Menu icons use two cache layers:
 1. In-memory `Bitmap` cache in the resident process.
 2. Persistent PNG cache under `%LOCALAPPDATA%\Taskbar-Groups\Cache\MenuIcons`.
 
-Cache identity is based on the local group item rather than probing the target application's metadata. This is important for shortcuts whose targets live on slow, sleeping, removable, or network storage.
+Cache identity is based on the local group item rather than target application metadata, avoiding unnecessary probes of slow or sleeping target storage.
+
+The installed `Icon Library` is separate from the rendered menu-icon cache. It is starter/user-owned mutable content: Setup seeds missing files but does not overwrite or uninstall existing library files.
 
 ## Taskbar positioning
 
-The resident host records low-level mouse-down coordinates before the short-lived taskbar launcher starts. When a group request arrives, the recorded click is accepted only if it is recent and lies inside the Windows taskbar rectangle.
+The resident host records low-level mouse-down coordinates before the short-lived launcher starts. The click is accepted only if it is recent and lies inside the Windows taskbar rectangle.
 
-The popup is then anchored to the desktop-facing edge of the taskbar using that original click coordinate. Later cursor movement is not sampled for positioning. This prevents the menu from following the mouse when the user moves quickly after clicking the taskbar icon.
+The popup is anchored to the desktop-facing edge of the taskbar using that original click coordinate. Later cursor movement is not sampled for positioning.
+
+## Taskbar pin management
+
+Each group has a source shortcut under `%LOCALAPPDATA%\Taskbar-Groups\Pin to Taskbar`.
+
+For new groups, Taskbar Groups submits a native taskbar-pin request through Windows' taskband `IPinnedList3` interface. Legacy shell verbs remain fallbacks for older behavior. A successful native request is asynchronous because Windows may display confirmation UI.
+
+Unpin and delete operations use the taskbar pin state plus the source shortcut. Delete Group attempts to unpin before removing the group directory and source shortcut.
+
+## Explorer integration
+
+Setup registers **Pin to Taskbar Group** for both files and directories. Explorer launches `--pin-to-group`, which initializes a standalone Add Link dialog rather than contacting or becoming the resident host.
+
+The dialog requires a destination group and can create a new group inline.
 
 ## Link Properties worker
 
-Windows shortcut property sheets are native/modeless. If the process that opens the sheet exits immediately, the property window disappears or fails to behave correctly.
-
-`--link-properties-worker` isolates this operation in a dedicated process with a hidden WinForms owner and message loop. The worker monitors the native property window and exits after it closes.
+Windows shortcut property sheets are native/modeless. `--link-properties-worker` isolates this operation in a dedicated process with a hidden WinForms owner and message loop. The worker exits after the property sheet closes.
 
 ## Filesystem data model
 
@@ -82,7 +92,7 @@ A group is a directory under:
 %LOCALAPPDATA%\Taskbar-Groups\Groups\<Group Name>\
 ```
 
-Display order is encoded in numeric filename prefixes. For example:
+Display order is encoded in numeric filename prefixes:
 
 ```text
 010 - Visual Studio.lnk
