@@ -3,10 +3,15 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
 using System.IO;
+using System.IO.Pipes;
 using System.Linq;
 using System.Runtime.InteropServices;
+using System.Security.Cryptography;
+using System.Security.AccessControl;
+using System.Security.Principal;
 using System.Text;
 using System.Text.RegularExpressions;
+using System.Threading;
 using System.Windows.Forms;
 
 internal static class Program
@@ -20,38 +25,121 @@ internal static class Program
     private static readonly string TemplatesRoot = Path.Combine(AppRoot, "_templates");
     private static readonly string IconRoot = Path.Combine(AppRoot, "Icon Library");
     private static readonly string ExePath = Path.Combine(AppRoot, "Taskbar-GroupMenu.exe");
+    private static readonly string IconCacheRoot = Path.Combine(DataRoot, "Cache", "MenuIcons");
+    private static readonly Dictionary<string, Bitmap> MemoryIconCache =
+        new Dictionary<string, Bitmap>(StringComparer.OrdinalIgnoreCase);
+    private static readonly Stopwatch PerfClock = Stopwatch.StartNew();
+    private static readonly bool PerfEnabled =
+        String.Equals(Environment.GetEnvironmentVariable("TASKBAR_GROUPS_PERF"), "1", StringComparison.OrdinalIgnoreCase);
+    private static readonly string SessionLogPath = Path.Combine(
+        DataRoot,
+        "TaskbarGroups_" + DateTime.Now.ToString("yyyyMMdd-HHmmss") + ".log");
+    private static readonly object SessionLogLock = new object();
+    private static bool SessionLogActive;
+    private static int PerfIconCacheHits;
+    private static int PerfIconCacheMisses;
+    private static bool PerfFirstMenuPaintLogged;
+    private static readonly Queue<ToolStripItem> DeferredMenuDisposals =
+        new Queue<ToolStripItem>();
+    private static bool DeferredDisposalScheduled;
+    private sealed class CachedGroupMenu
+    {
+        public string Signature;
+        public ToolStripItem[] Items;
+    }
+
+    private static readonly Dictionary<string, CachedGroupMenu> GroupMenuCache =
+        new Dictionary<string, CachedGroupMenu>(StringComparer.OrdinalIgnoreCase);
+    private static string AttachedCachedGroup;
+    private static bool PrewarmMode;
+    private static bool PrewarmStarted;
+    private static Stopwatch PerfMenuClock;
 
     private static string Group;
     private static string GroupFolder;
     private static ContextMenuStrip MainMenu;
     private static Form HostForm;
     private static Point MenuPoint;
-    private static bool RefreshRequested;
-    private static bool PreserveMenuPoint;
     private static Point ExactRestorePoint;
     private static bool UseExactRestorePoint;
     private static Point LastMainMenuLocation;
     private static bool HaveLastMainMenuLocation;
-    private static bool KeepHostAliveForCommand;
     private static ToolStripItem DragCandidate;
     private static Point DragStartScreen;
     private static bool ReorderDragging;
     private static int DragInsertionIndex = -1;
     private static bool SuppressNextLaunch;
+    private static Mutex HostMutex;
+    private static Thread PipeServerThread;
+    private static volatile bool HostShuttingDown;
+    private static readonly string HostInstanceSuffix =
+        Process.GetCurrentProcess().SessionId + "-" + GetCurrentUserSidForIpcName();
+    private static readonly string HostMutexName =
+        @"Local\Taskbar-Groups-MenuHost-" + HostInstanceSuffix;
+    private static readonly string HostPipeName =
+        "Taskbar-Groups-MenuHost-" + HostInstanceSuffix;
+
+    private static IntPtr MouseHookHandle = IntPtr.Zero;
+    private static LowLevelMouseProc MouseHookCallback;
+    private static readonly object LastMouseClickLock = new object();
+    private static Point LastMouseClickPoint = Point.Empty;
+    private static long LastMouseClickTick;
 
     private static readonly string[] AllowedExtensions =
     {
         ".lnk", ".url", ".exe", ".bat", ".cmd", ".ps1", ".separator", ".heading"
     };
 
+    private static void InitializeWinForms()
+    {
+        // SetCompatibleTextRenderingDefault must run before the first WinForms
+        // window/handle is created in this process.
+        Application.EnableVisualStyles();
+        Application.SetCompatibleTextRenderingDefault(false);
+        PerfLog("WinForms initialized");
+    }
+
+    private static Point GetNativeCursorPosition()
+    {
+        POINT point;
+        if (GetCursorPos(out point))
+            return new Point(point.x, point.y);
+
+        return Point.Empty;
+    }
+
+    private static string GetCurrentUserSidForIpcName()
+    {
+        try
+        {
+            SecurityIdentifier sid = WindowsIdentity.GetCurrent().User;
+            return sid == null ? "unknown" : sid.Value.Replace("-", "_");
+        }
+        catch
+        {
+            return "unknown";
+        }
+    }
+
     [STAThread]
     private static void Main(string[] args)
     {
-        Application.EnableVisualStyles();
-        Application.SetCompatibleTextRenderingDefault(false);
-
-        if (args.Length < 1 || String.IsNullOrWhiteSpace(args[0]))
+        // Native Shell property sheets get their own process.
+        if (args.Length >= 2 &&
+            String.Equals(args[0], "--link-properties-worker", StringComparison.OrdinalIgnoreCase))
         {
+            InitializeWinForms();
+            RunLinkPropertiesWorker(args[1]);
+            return;
+        }
+
+        bool hostOnly =
+            args.Length == 1 &&
+            String.Equals(args[0], "--resident-host", StringComparison.OrdinalIgnoreCase);
+
+        if (!hostOnly && (args.Length < 1 || String.IsNullOrWhiteSpace(args[0])))
+        {
+            InitializeWinForms();
             MessageBox.Show("A group name is required.", "Taskbar Groups",
                 MessageBoxButtons.OK, MessageBoxIcon.Error);
             return;
@@ -60,26 +148,169 @@ internal static class Program
         Directory.CreateDirectory(DataRoot);
         Directory.CreateDirectory(GroupsRoot);
         Directory.CreateDirectory(PinRoot);
+        Directory.CreateDirectory(IconCacheRoot);
+        PerfLog("Data directories ready");
+        PerfLog("IPC identity: session=" + Process.GetCurrentProcess().SessionId +
+            "; mutex=" + HostMutexName + "; pipe=" + HostPipeName);
 
-        Group = args[0];
-        GroupFolder = Path.Combine(GroupsRoot, Group);
+        string requestedGroup = hostOnly ? null : args[0];
+        Point requestedMenuPoint = hostOnly ? Point.Empty : GetNativeCursorPosition();
 
-        if (!Directory.Exists(GroupFolder))
+        // IPC is the authoritative resident-host health check. A named mutex only
+        // tells us that some process created/owns that kernel object; it does not
+        // prove that the menu host is alive, initialized, or listening.
+        if (hostOnly)
         {
-            MessageBox.Show("Taskbar group folder does not exist:\r\n" + GroupFolder,
-                "Taskbar Groups", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            if (PingResidentHost())
+            {
+                PerfLog("Resident host already running and responsive; host-only invocation exiting");
+                return;
+            }
+        }
+        else
+        {
+            if (SendGroupToResidentHost(requestedGroup, requestedMenuPoint))
+            {
+                PerfLog("Forwarded group to resident host: " + requestedGroup);
+                return;
+            }
+        }
+
+        bool createdNew;
+        HostMutex = new Mutex(true, HostMutexName, out createdNew);
+
+        if (!createdNew)
+        {
+            // Another process may be in the short interval between taking the
+            // mutex and opening its pipe. Retry the pipe, not the mutex.
+            for (int attempt = 0; attempt < 40; attempt++)
+            {
+                Thread.Sleep(50);
+
+                if (hostOnly)
+                {
+                    if (PingResidentHost())
+                    {
+                        PerfLog("Resident host became responsive after retry");
+                        HostMutex.Dispose();
+                        HostMutex = null;
+                        return;
+                    }
+                }
+                else if (SendGroupToResidentHost(requestedGroup, requestedMenuPoint))
+                {
+                    PerfLog("Forwarded group to resident host after retry: " + requestedGroup);
+                    HostMutex.Dispose();
+                    HostMutex = null;
+                    return;
+                }
+            }
+
+            PerfLog("Resident mutex exists but pipe remained unavailable for 2 seconds");
+            InitializeWinForms();
+            MessageBox.Show(
+                "Taskbar Groups found an existing resident-host mutex, but no IPC server " +
+                "became available within 2 seconds. Check the performance log for the " +
+                "resident process and pipe name.",
+                "Taskbar Groups",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Error);
+            HostMutex.Dispose();
+            HostMutex = null;
             return;
         }
 
-        do
+        try
         {
-            RefreshRequested = false;
-            ShowGroupMenu();
+            // This process won the resident-host election. It owns one general
+            // session log until the process exits, regardless of PERF settings.
+            StartSessionLog();
+            InstallUnhandledExceptionLogging();
+            LogInfo("Initializing WinForms.");
+            InitializeWinForms();
+            LogInfo("Initializing persistent menu host.");
+            InitializePersistentHost();
+            LogInfo("Starting taskbar mouse click tracker.");
+            StartMouseClickTracker();
+            LogInfo("Starting IPC pipe server.");
+            StartPipeServer();
+
+            HostForm.Shown += delegate
+            {
+                HostForm.BeginInvoke((MethodInvoker)delegate
+                {
+                    if (hostOnly)
+                    {
+                        PerfLog("Resident host started in prewarm mode");
+                        PrewarmAllGroupMenus();
+                    }
+                    else
+                    {
+                        ShowRequestedGroup(requestedGroup, false, requestedMenuPoint);
+                    }
+                });
+            };
+
+            LogInfo("Resident host startup complete; entering application message loop.");
+            PerfLog("Persistent host Application.Run starting");
+            Application.Run(HostForm);
+            PerfLog("Persistent host Application.Run returned");
+            LogInfo("Application message loop returned; resident host is shutting down.");
         }
-        while (RefreshRequested && Directory.Exists(GroupFolder));
+        catch (Exception ex)
+        {
+            LogError("Fatal resident-host exception.", ex);
+            throw;
+        }
+        finally
+        {
+            LogInfo("Resident host cleanup starting.");
+            HostShuttingDown = true;
+            StopMouseClickTracker();
+
+            foreach (KeyValuePair<string, CachedGroupMenu> pair in GroupMenuCache)
+            {
+                if (String.Equals(pair.Key, AttachedCachedGroup, StringComparison.OrdinalIgnoreCase))
+                    continue;
+                if (pair.Value == null || pair.Value.Items == null)
+                    continue;
+                foreach (ToolStripItem item in pair.Value.Items)
+                {
+                    try { item.Dispose(); } catch { }
+                }
+            }
+            GroupMenuCache.Clear();
+            AttachedCachedGroup = null;
+
+            while (DeferredMenuDisposals.Count > 0)
+            {
+                try { DeferredMenuDisposals.Dequeue().Dispose(); }
+                catch { }
+            }
+
+            if (MainMenu != null)
+            {
+                MainMenu.Dispose();
+                MainMenu = null;
+            }
+
+            if (HostForm != null)
+            {
+                HostForm.Dispose();
+                HostForm = null;
+            }
+
+            if (HostMutex != null)
+            {
+                try { HostMutex.ReleaseMutex(); }
+                catch { }
+                HostMutex.Dispose();
+                HostMutex = null;
+            }
+        }
     }
 
-    private static void ShowGroupMenu()
+    private static void InitializePersistentHost()
     {
         HostForm = new Form
         {
@@ -87,22 +318,538 @@ internal static class Program
             FormBorderStyle = FormBorderStyle.None,
             StartPosition = FormStartPosition.Manual,
             Size = new Size(1, 1),
-            Opacity = 0,
-            TopMost = true
+            Location = new Point(-32000, -32000),
+            ShowIcon = false,
+            TopMost = false
         };
+        PerfLog("Persistent HostForm constructed");
 
         MainMenu = new ContextMenuStrip
         {
             ShowImageMargin = true,
             ShowCheckMargin = false
         };
+        PerfLog("Persistent ContextMenuStrip constructed");
 
         ApplyTheme(MainMenu);
         MainMenu.Paint += MainMenuPaint;
         MainMenu.MouseMove += ReorderMouseMove;
         MainMenu.MouseUp += ReorderMouseUp;
+        MainMenu.Opening += delegate { PerfLog("ContextMenuStrip Opening event"); };
+        MainMenu.Opened += delegate { PerfLog("ContextMenuStrip Opened event"); };
+        MainMenu.Paint += delegate { PerfLogOncePerMenuPaint(); };
 
+        // Create the host HWND once. Subsequent menu invocations reuse it.
+        HostForm.Show();
+        PerfLog("Persistent HostForm shown");
+    }
+
+    private static void StartMouseClickTracker()
+    {
+        MouseHookCallback = MouseHookProc;
+
+        using (Process process = Process.GetCurrentProcess())
+        using (ProcessModule module = process.MainModule)
+        {
+            IntPtr moduleHandle = GetModuleHandle(module.ModuleName);
+            MouseHookHandle = SetWindowsHookEx(
+                WH_MOUSE_LL,
+                MouseHookCallback,
+                moduleHandle,
+                0);
+        }
+
+        if (MouseHookHandle == IntPtr.Zero)
+        {
+            int error = Marshal.GetLastWin32Error();
+            PerfLog("Mouse click tracker failed; Win32=" + error);
+        }
+        else
+        {
+            PerfLog("Mouse click tracker started");
+        }
+    }
+
+    private static void StopMouseClickTracker()
+    {
+        if (MouseHookHandle == IntPtr.Zero)
+            return;
+
+        UnhookWindowsHookEx(MouseHookHandle);
+        MouseHookHandle = IntPtr.Zero;
+        MouseHookCallback = null;
+    }
+
+    private static IntPtr MouseHookProc(int nCode, IntPtr wParam, IntPtr lParam)
+    {
+        if (nCode >= 0 && wParam.ToInt32() == WM_LBUTTONDOWN)
+        {
+            MSLLHOOKSTRUCT data =
+                (MSLLHOOKSTRUCT)Marshal.PtrToStructure(
+                    lParam,
+                    typeof(MSLLHOOKSTRUCT));
+
+            lock (LastMouseClickLock)
+            {
+                LastMouseClickPoint = new Point(data.pt.x, data.pt.y);
+                LastMouseClickTick = Environment.TickCount;
+            }
+        }
+
+        return CallNextHookEx(MouseHookHandle, nCode, wParam, lParam);
+    }
+
+    private static bool TryGetRecentMouseClick(out Point point)
+    {
+        lock (LastMouseClickLock)
+        {
+            // IPC startup should normally arrive within a few hundred
+            // milliseconds of the taskbar click. A two-second window allows
+            // for a busy machine while preventing an unrelated old click from
+            // positioning a later menu request.
+            uint age = unchecked(
+                (uint)(Environment.TickCount - LastMouseClickTick));
+
+            if (LastMouseClickTick != 0 && age <= 2000)
+            {
+                point = LastMouseClickPoint;
+                return true;
+            }
+        }
+
+        point = Point.Empty;
+        return false;
+    }
+
+    private static void StartPipeServer()
+    {
+        PipeServerThread = new Thread(delegate()
+        {
+            while (!HostShuttingDown)
+            {
+                try
+                {
+                    PipeSecurity pipeSecurity = new PipeSecurity();
+                    SecurityIdentifier currentUser = WindowsIdentity.GetCurrent().User;
+                    pipeSecurity.SetAccessRuleProtection(true, false);
+                    pipeSecurity.AddAccessRule(new PipeAccessRule(
+                        currentUser,
+                        PipeAccessRights.FullControl,
+                        AccessControlType.Allow));
+
+                    using (var server = new NamedPipeServerStream(
+                        HostPipeName,
+                        PipeDirection.In,
+                        1,
+                        PipeTransmissionMode.Byte,
+                        PipeOptions.None,
+                        0,
+                        0,
+                        pipeSecurity))
+                    {
+                        server.WaitForConnection();
+
+                        using (var reader = new StreamReader(server, Encoding.UTF8))
+                        {
+                            string requestedGroup = reader.ReadLine();
+                            string xText = reader.ReadLine();
+                            string yText = reader.ReadLine();
+
+                            if (String.IsNullOrWhiteSpace(requestedGroup))
+                                continue;
+
+                            if (String.Equals(requestedGroup, "__PING__", StringComparison.Ordinal))
+                            {
+                                PerfLog("Resident host IPC ping received");
+                                continue;
+                            }
+
+                            int requestedX;
+                            int requestedY;
+                            Point requestedPoint = Cursor.Position;
+                            if (Int32.TryParse(xText, out requestedX) &&
+                                Int32.TryParse(yText, out requestedY))
+                            {
+                                requestedPoint = new Point(requestedX, requestedY);
+                            }
+
+                            // The launcher does not start until after Windows has
+                            // processed the taskbar click, so even its earliest
+                            // Cursor.Position sample can be too late if the mouse
+                            // is moved immediately. The resident process observes
+                            // the actual global left-button-down instead.
+                            Point actualClickPoint;
+                            if (TryGetRecentMouseClick(out actualClickPoint))
+                                requestedPoint = actualClickPoint;
+
+                            Form host = HostForm;
+                            if (host == null || host.IsDisposed)
+                                continue;
+
+                            PerfLog("IPC group request received: " + requestedGroup);
+                            host.BeginInvoke((MethodInvoker)delegate
+                            {
+                                ShowRequestedGroup(requestedGroup, false, requestedPoint);
+                            });
+                        }
+                    }
+                }
+                catch (IOException)
+                {
+                    if (!HostShuttingDown)
+                        Thread.Sleep(25);
+                }
+                catch (ObjectDisposedException)
+                {
+                    break;
+                }
+                catch (Exception ex)
+                {
+                    PerfLog("Pipe server error: " + ex.Message);
+                    if (!HostShuttingDown)
+                        Thread.Sleep(100);
+                }
+            }
+        });
+
+        PipeServerThread.IsBackground = true;
+        PipeServerThread.Name = "Taskbar Groups IPC";
+        PipeServerThread.Start();
+        PerfLog("Persistent host pipe server started: " + HostPipeName);
+    }
+
+    private static bool SendGroupToResidentHost(string requestedGroup, Point requestedPoint)
+    {
+        try
+        {
+            using (var client = new NamedPipeClientStream(
+                ".",
+                HostPipeName,
+                PipeDirection.Out,
+                PipeOptions.None))
+            {
+                client.Connect(150);
+
+                using (var writer = new StreamWriter(client, Encoding.UTF8))
+                {
+                    writer.AutoFlush = true;
+                    writer.WriteLine(requestedGroup);
+                    writer.WriteLine(requestedPoint.X);
+                    writer.WriteLine(requestedPoint.Y);
+                }
+            }
+
+            return true;
+        }
+        catch (Exception ex)
+        {
+            PerfLog("IPC send failed on pipe '" + HostPipeName + "': " +
+                ex.GetType().Name + ": " + ex.Message);
+            return false;
+        }
+    }
+
+    private static bool PingResidentHost()
+    {
+        try
+        {
+            using (var client = new NamedPipeClientStream(
+                ".",
+                HostPipeName,
+                PipeDirection.Out,
+                PipeOptions.None))
+            {
+                client.Connect(250);
+
+                using (var writer = new StreamWriter(client, Encoding.UTF8))
+                {
+                    writer.AutoFlush = true;
+                    writer.WriteLine("__PING__");
+                    writer.WriteLine("0");
+                    writer.WriteLine("0");
+                }
+            }
+
+            return true;
+        }
+        catch (Exception ex)
+        {
+            PerfLog("IPC ping failed on pipe '" + HostPipeName + "': " +
+                ex.GetType().Name + ": " + ex.Message);
+            return false;
+        }
+    }
+
+    private static Queue<string> PrewarmQueue;
+    private static Stopwatch PrewarmClock;
+
+    private static void PrewarmAllGroupMenus()
+    {
+        if (PrewarmStarted)
+            return;
+
+        PrewarmStarted = true;
+        PrewarmClock = Stopwatch.StartNew();
+        PrewarmQueue = new Queue<string>(
+            Directory.GetDirectories(GroupsRoot)
+                .Select(path => Path.GetFileName(path))
+                .OrderBy(name => name, StringComparer.CurrentCultureIgnoreCase));
+
+        PerfLog("Menu prewarm queued; groups=" + PrewarmQueue.Count);
+        QueueNextPrewarmGroup();
+    }
+
+    private static void QueueNextPrewarmGroup()
+    {
+        if (HostShuttingDown || HostForm == null || HostForm.IsDisposed)
+            return;
+
+        HostForm.BeginInvoke((MethodInvoker)delegate
+        {
+            if (HostShuttingDown)
+                return;
+
+            // A real user request always wins over background warmup.
+            if (MainMenu != null && MainMenu.Visible)
+            {
+                HostForm.BeginInvoke((MethodInvoker)delegate { QueueNextPrewarmGroup(); });
+                return;
+            }
+
+            if (PrewarmQueue == null || PrewarmQueue.Count == 0)
+            {
+                PrewarmMode = false;
+                PerfLog("Menu prewarm completed; cached groups=" +
+                    GroupMenuCache.Count + " in " +
+                    (PrewarmClock == null ? "0.0" :
+                        PrewarmClock.Elapsed.TotalMilliseconds.ToString("0.0")) + " ms");
+                return;
+            }
+
+            string groupName = PrewarmQueue.Dequeue();
+            PerfLog("Prewarming group: " + groupName);
+
+            try
+            {
+                PrewarmMode = true;
+                ShowRequestedGroup(groupName, false, Point.Empty);
+
+                if (MainMenu.Items.Count > 0)
+                    MainMenu.Items.Clear();
+
+                AttachedCachedGroup = null;
+            }
+            catch (Exception ex)
+            {
+                PerfLog("Prewarm failed for '" + groupName + "': " +
+                    ex.GetType().Name + ": " + ex.Message);
+            }
+            finally
+            {
+                PrewarmMode = false;
+            }
+
+            // Yield back to the message pump before building the next group.
+            QueueNextPrewarmGroup();
+        });
+    }
+
+    private static void ShowRequestedGroup(
+        string requestedGroup,
+        bool preserveLocation,
+        Point requestedPoint)
+    {
+        string requestedFolder = Path.Combine(GroupsRoot, requestedGroup);
+        if (!Directory.Exists(requestedFolder))
+        {
+            MessageBox.Show("Taskbar group folder does not exist:\r\n" + requestedFolder,
+                "Taskbar Groups", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            return;
+        }
+
+        if (MainMenu != null && MainMenu.Visible)
+        {
+            string deferredGroup = requestedGroup;
+            bool deferredPreserveLocation = preserveLocation;
+            Point deferredRequestedPoint = requestedPoint;
+
+            ToolStripDropDownClosedEventHandler closedHandler = null;
+            closedHandler = delegate
+            {
+                MainMenu.Closed -= closedHandler;
+
+                HostForm.BeginInvoke((MethodInvoker)delegate
+                {
+                    ShowRequestedGroup(
+                        deferredGroup,
+                        deferredPreserveLocation,
+                        deferredRequestedPoint);
+                });
+            };
+
+            MainMenu.Closed += closedHandler;
+            MainMenu.Close(ToolStripDropDownCloseReason.AppClicked);
+            return;
+        }
+
+        Group = requestedGroup;
+        GroupFolder = requestedFolder;
+        if (!preserveLocation)
+        {
+            UseExactRestorePoint = false;
+            Point taskbarAnchor;
+            if (TryGetTaskbarButtonAnchor(requestedGroup, out taskbarAnchor))
+            {
+                MenuPoint = taskbarAnchor;
+                PerfLog("Taskbar button anchor found for '" + requestedGroup +
+                    "': " + taskbarAnchor.X + "," + taskbarAnchor.Y);
+            }
+            else
+            {
+                // Fallback only. Normally the popup is positioned from the
+                // actual Windows taskbar button rectangle, not the mouse.
+                MenuPoint = requestedPoint;
+                PerfLog("Taskbar button anchor not found for '" + requestedGroup +
+                    "'; using launch point " + requestedPoint.X + "," + requestedPoint.Y);
+            }
+        }
+
+        ShowGroupMenu();
+    }
+
+    private static bool TryGetTaskbarButtonAnchor(string requestedGroup, out Point anchor)
+    {
+        anchor = Point.Empty;
+
+        Point clickPoint;
+        if (!TryGetRecentMouseClick(out clickPoint))
+            return false;
+
+        IntPtr taskbar = FindWindow("Shell_TrayWnd", null);
+        if (taskbar == IntPtr.Zero)
+            return false;
+
+        RECT taskbarRect;
+        if (!GetWindowRect(taskbar, out taskbarRect))
+            return false;
+
+        // Only accept the tracked mouse-down if it actually occurred inside
+        // the taskbar. This is the click that launched the shortcut, captured
+        // by the resident process before the launcher even starts.
+        if (clickPoint.X < taskbarRect.Left || clickPoint.X >= taskbarRect.Right ||
+            clickPoint.Y < taskbarRect.Top || clickPoint.Y >= taskbarRect.Bottom)
+            return false;
+
+        Rectangle workingArea = Screen.FromPoint(clickPoint).WorkingArea;
+
+        if (taskbarRect.Top >= workingArea.Bottom)
+        {
+            // Bottom taskbar.
+            anchor = new Point(clickPoint.X, taskbarRect.Top);
+        }
+        else if (taskbarRect.Bottom <= workingArea.Top)
+        {
+            // Top taskbar.
+            anchor = new Point(clickPoint.X, taskbarRect.Bottom);
+        }
+        else if (taskbarRect.Left >= workingArea.Right)
+        {
+            // Right taskbar.
+            anchor = new Point(taskbarRect.Left, clickPoint.Y);
+        }
+        else
+        {
+            // Left taskbar.
+            anchor = new Point(taskbarRect.Right, clickPoint.Y);
+        }
+
+        PerfLog(
+            "Taskbar launch anchor from resident mouse-down for '" +
+            requestedGroup + "': " + anchor.X + "," + anchor.Y);
+
+        return true;
+    }
+
+    private static string GetGroupMenuSignature(string folder)
+    {
+        try
+        {
+            var builder = new StringBuilder();
+            foreach (string path in Directory.GetFiles(folder, "*", SearchOption.TopDirectoryOnly)
+                .OrderBy(p => p, StringComparer.OrdinalIgnoreCase))
+            {
+                FileInfo info = new FileInfo(path);
+                builder.Append(info.Name).Append('|')
+                    .Append(info.Length).Append('|')
+                    .Append(info.LastWriteTimeUtc.Ticks).Append(';');
+            }
+            return builder.ToString();
+        }
+        catch
+        {
+            return Guid.NewGuid().ToString("N");
+        }
+    }
+
+    private static void ShowGroupMenu()
+    {
+        PerfMenuClock = Stopwatch.StartNew();
+        PerfIconCacheHits = 0;
+        PerfIconCacheMisses = 0;
+        PerfFirstMenuPaintLogged = false;
+        PerfLog("Menu rebuild started for group: " + Group);
+
+        string signature = GetGroupMenuSignature(GroupFolder);
+        CachedGroupMenu cached;
+        bool cacheHit =
+            GroupMenuCache.TryGetValue(Group, out cached) &&
+            cached != null &&
+            cached.Items != null &&
+            String.Equals(cached.Signature, signature, StringComparison.Ordinal);
+
+        if (MainMenu.Items.Count > 0)
+        {
+            ToolStripItem[] oldItems = new ToolStripItem[MainMenu.Items.Count];
+            MainMenu.Items.CopyTo(oldItems, 0);
+            MainMenu.Items.Clear();
+
+            if (String.IsNullOrEmpty(AttachedCachedGroup))
+            {
+                foreach (ToolStripItem oldItem in oldItems)
+                    DeferredMenuDisposals.Enqueue(oldItem);
+            }
+
+            AttachedCachedGroup = null;
+        }
+
+        if (cacheHit)
+        {
+            MainMenu.Items.AddRange(cached.Items);
+            AttachedCachedGroup = Group;
+            PerfLog("Group menu cache hit; reattached " + cached.Items.Length + " top-level items");
+            if (!PrewarmMode)
+                ShowPreparedMainMenu();
+            return;
+        }
+
+        if (cached != null)
+        {
+            GroupMenuCache.Remove(Group);
+            if (cached.Items != null)
+            {
+                foreach (ToolStripItem item in cached.Items)
+                    DeferredMenuDisposals.Enqueue(item);
+            }
+            PerfLog("Stale group menu cache invalidated");
+        }
+
+        PerfLog("Group menu cache miss; building hierarchy");
+        PerfLog("GetGroupItems starting");
+        Stopwatch enumerateClock = Stopwatch.StartNew();
         List<FileInfo> files = GetGroupItems();
+        enumerateClock.Stop();
+        PerfLog("Group enumerated (" + files.Count + " items) in " +
+            enumerateClock.Elapsed.TotalMilliseconds.ToString("0.0") + " ms");
 
         if (files.Count == 0)
         {
@@ -114,6 +861,9 @@ internal static class Program
             foreach (FileInfo file in files)
                 AddGroupItem(file);
         }
+
+        PerfLog("Group items constructed; icon cache hits=" + PerfIconCacheHits + ", misses=" + PerfIconCacheMisses);
+        PerfLog("Static menu items construction starting");
 
         if (MainMenu.Items.Count > 0 &&
             !(MainMenu.Items[MainMenu.Items.Count - 1] is ToolStripSeparator))
@@ -165,7 +915,6 @@ internal static class Program
         // dialogs (Add Link, New Group, Rename, icon pickers, etc.) survive.
         options.DropDown.ItemClicked += delegate
         {
-            KeepHostAliveForCommand = true;
         };
 
         ApplyTheme(options.DropDown);
@@ -177,39 +926,58 @@ internal static class Program
         }
 
         MainMenu.Items.Add(options);
+        PerfLog("Static menu items constructed");
 
-        MenuPoint = Cursor.Position;
-        HostForm.Location = UseExactRestorePoint ? ExactRestorePoint : MenuPoint;
-        HostForm.Show();
+
+        // Give the persistent popup a real owner window. Showing the
+        // ContextMenuStrip by absolute screen coordinate leaves it effectively
+        // ownerless; that worked when the old process died with the menu, but a
+        // resident process can then leave the popup open after focus moves
+        // elsewhere. Owning it with HostForm restores normal ContextMenuStrip
+        // AutoClose behavior without destroying the persistent host.
+
+        ToolStripItem[] builtItems = new ToolStripItem[MainMenu.Items.Count];
+        MainMenu.Items.CopyTo(builtItems, 0);
+        GroupMenuCache[Group] = new CachedGroupMenu
+        {
+            Signature = signature,
+            Items = builtItems
+        };
+        AttachedCachedGroup = Group;
+        PerfLog("Group menu cached; top-level items=" + builtItems.Length);
+
+        if (!PrewarmMode)
+            ShowPreparedMainMenu();
+    }
+
+    private static void ShowPreparedMainMenu()
+    {
+        Point showPoint = UseExactRestorePoint ? ExactRestorePoint : MenuPoint;
+        HostForm.Location = showPoint;
+
+        // Activate immediately before showing. ContextMenuStrip then owns the
+        // popup-mode message loop and its built-in AutoClose semantics. Do not
+        // separately close from HostForm.Deactivate: taskbar launcher clicks
+        // legitimately move focus during IPC startup and that creates a race
+        // where the newly requested menu is closed before it paints.
         HostForm.Activate();
 
-        MainMenu.Closed += delegate
-        {
-            if (!KeepHostAliveForCommand)
-                HostForm.Close();
-        };
+        PerfLog("ContextMenuStrip.Show starting");
+        MainMenu.Show(HostForm, new Point(0, 0));
+
         if (UseExactRestorePoint)
         {
-            MainMenu.Show(new Point(0, 0));
             MainMenu.Location = ExactRestorePoint;
             UseExactRestorePoint = false;
-            PreserveMenuPoint = false;
         }
-        else
-        {
-            MainMenu.Show(MenuPoint);
-        }
+
+        PerfLog("ContextMenuStrip.Show returned");
 
         // Persist the actual top-left while the menu is definitely still open.
         // Submenu commands close MainMenu before their Click handlers run, so
         // RefreshMenu() cannot reliably query MainMenu.Location later.
         LastMainMenuLocation = MainMenu.Location;
         HaveLastMainMenuLocation = true;
-
-        Application.Run(HostForm);
-
-        MainMenu.Dispose();
-        HostForm.Dispose();
     }
 
     private static void AddGroupItem(FileInfo file)
@@ -484,7 +1252,6 @@ internal static class Program
 
         ownerItem.DropDown.ItemClicked += delegate
         {
-            KeepHostAliveForCommand = true;
         };
 
         ApplyTheme(ownerItem.DropDown);
@@ -557,14 +1324,6 @@ internal static class Program
             }
             finally
             {
-                KeepHostAliveForCommand = false;
-
-                if (!RefreshRequested &&
-                    (MainMenu == null || !MainMenu.Visible) &&
-                    HostForm != null && !HostForm.IsDisposed)
-                {
-                    HostForm.Close();
-                }
             }
         };
         return item;
@@ -895,9 +1654,21 @@ internal static class Program
                 if (!File.Exists(target) && !Directory.Exists(target))
                     throw new FileNotFoundException("Target does not exist.", target);
 
+                // Keep the display name based on what the user selected before a
+                // script target is rewritten to its interpreter executable.
                 string name = SanitizeFileName(dialog.LinkName.Trim());
                 if (name.Length == 0)
                     name = Path.GetFileNameWithoutExtension(target.TrimEnd('\\'));
+
+                string selectedTarget = target;
+                if (Path.GetExtension(selectedTarget).Equals(".ps1", StringComparison.OrdinalIgnoreCase))
+                {
+                    target = FindPowerShellHost();
+                    string scriptArguments = "-NoProfile -ExecutionPolicy Bypass -File " + Quote(selectedTarget);
+                    if (!String.IsNullOrWhiteSpace(arguments))
+                        scriptArguments += " " + arguments.Trim();
+                    arguments = scriptArguments;
+                }
 
                 int prefix = relative
                     ? GetInsertionPrefix(anchorPath, false)
@@ -906,9 +1677,9 @@ internal static class Program
                 string linkPath = UniquePath(Path.Combine(GroupFolder,
                     PrefixName(prefix, name, ".lnk")));
 
-                string workingDirectory = File.Exists(target)
-                    ? Path.GetDirectoryName(target)
-                    : target;
+                string workingDirectory = File.Exists(selectedTarget)
+                    ? Path.GetDirectoryName(selectedTarget)
+                    : selectedTarget;
 
                 // The dialog is the source of truth. When an existing .lnk is
                 // selected, AddLinkDialog resolves its target and arguments into
@@ -921,6 +1692,65 @@ internal static class Program
             }
             catch (Exception ex) { Error("Could not add link.", ex); }
         }
+    }
+
+    private static string BuildVisiblePowerShellArguments(string scriptPath, string existingArguments)
+    {
+        string existing = (existingArguments ?? "").Trim();
+        string quotedScript = Quote(scriptPath);
+
+        // With a blank field, expose the complete default command line. The user
+        // can then remove -NoProfile / -ExecutionPolicy Bypass or append script
+        // parameters before creating the link.
+        if (existing.Length == 0)
+            return "-NoProfile -ExecutionPolicy Bypass -File " + quotedScript;
+
+        // Do not overwrite user-entered arguments. If they already reference the
+        // selected script, leave them exactly as entered. Otherwise retain them and
+        // add the required -File argument. Existing text is kept before -File so it
+        // remains PowerShell-host arguments rather than accidentally becoming script
+        // parameters. Once visible, the user can place script parameters after the
+        // script path if desired.
+        if (ArgumentsReferencePath(existing, scriptPath))
+            return existing;
+
+        return existing + " -File " + quotedScript;
+    }
+
+    private static bool ArgumentsReferencePath(string arguments, string path)
+    {
+        if (String.IsNullOrWhiteSpace(arguments) || String.IsNullOrWhiteSpace(path))
+            return false;
+
+        string expandedArguments = Environment.ExpandEnvironmentVariables(arguments);
+        string expandedPath = Environment.ExpandEnvironmentVariables(path);
+
+        return expandedArguments.IndexOf(expandedPath, StringComparison.OrdinalIgnoreCase) >= 0;
+    }
+
+    private static string FindPowerShellHost()
+    {
+        // Prefer PowerShell 7 when installed. Fall back to Windows PowerShell,
+        // which is present on supported Windows versions.
+        string programFiles = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles);
+        string pwsh = Path.Combine(programFiles, "PowerShell", "7", "pwsh.exe");
+        if (File.Exists(pwsh)) return pwsh;
+
+        string path = Environment.GetEnvironmentVariable("PATH") ?? "";
+        foreach (string entry in path.Split(Path.PathSeparator))
+        {
+            try
+            {
+                string directory = entry.Trim().Trim('"');
+                if (directory.Length == 0) continue;
+                string candidate = Path.Combine(directory, "pwsh.exe");
+                if (File.Exists(candidate)) return candidate;
+            }
+            catch { }
+        }
+
+        string windows = Environment.GetFolderPath(Environment.SpecialFolder.Windows);
+        return Path.Combine(windows, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
     }
 
     private sealed class AddLinkDialog : Form
@@ -1014,6 +1844,14 @@ internal static class Program
                                 ? "(Default)"
                                 : iconFile;
                         }
+                        else if (Path.GetExtension(selected).Equals(".ps1", StringComparison.OrdinalIgnoreCase))
+                        {
+                            // A PowerShell script is an argument to the PowerShell host,
+                            // not an executable target. Show that transformation in the UI
+                            // so the user can see and edit exactly what the shortcut will run.
+                            target.Text = FindPowerShellHost();
+                            arguments.Text = BuildVisiblePowerShellArguments(selected, arguments.Text);
+                        }
                         else
                         {
                             target.Text = selected;
@@ -1095,16 +1933,65 @@ internal static class Program
             if (!TryResolveShortcut(linkPath, out target, out args, out icon))
                 throw new InvalidOperationException("Could not resolve shortcut target.");
 
-            if (File.Exists(target))
+            string scriptPath;
+            if (TryGetPowerShellScriptPath(target, args, out scriptPath) &&
+                File.Exists(scriptPath))
+            {
+                Process.Start("explorer.exe", "/select," + Quote(scriptPath));
+            }
+            else if (File.Exists(target))
+            {
                 Process.Start("explorer.exe", "/select," + Quote(target));
+            }
             else if (Directory.Exists(target))
+            {
                 Process.Start("explorer.exe", Quote(target));
+            }
             else
+            {
                 throw new FileNotFoundException("Shortcut target no longer exists.", target);
+            }
 
             CloseMenu(false);
         }
         catch (Exception ex) { Error("Could not open file location.", ex); }
+    }
+
+    private static bool TryGetPowerShellScriptPath(string target, string arguments,
+        out string scriptPath)
+    {
+        scriptPath = "";
+
+        string executableName = Path.GetFileName(target);
+        bool isPowerShell =
+            executableName.Equals("powershell.exe", StringComparison.OrdinalIgnoreCase) ||
+            executableName.Equals("pwsh.exe", StringComparison.OrdinalIgnoreCase);
+
+        if (!isPowerShell || String.IsNullOrWhiteSpace(arguments))
+            return false;
+
+        Match match = Regex.Match(
+            arguments,
+            @"(?:^|\s)-(?:File|F)\s+(?:""(?<quoted>[^""]+)""|(?<plain>\S+))",
+            RegexOptions.IgnoreCase);
+
+        if (!match.Success)
+            return false;
+
+        scriptPath = match.Groups["quoted"].Success
+            ? match.Groups["quoted"].Value
+            : match.Groups["plain"].Value;
+
+        scriptPath = Environment.ExpandEnvironmentVariables(scriptPath);
+
+        if (!Path.IsPathRooted(scriptPath))
+        {
+            string linkDirectory = Path.GetDirectoryName(target);
+            if (!String.IsNullOrWhiteSpace(linkDirectory))
+                scriptPath = Path.GetFullPath(Path.Combine(linkDirectory, scriptPath));
+        }
+
+        return scriptPath.EndsWith(".ps1", StringComparison.OrdinalIgnoreCase);
     }
 
     private static void ShowTargetProperties(string linkPath)
@@ -1114,26 +2001,298 @@ internal static class Program
             string target, args, icon;
             if (!TryResolveShortcut(linkPath, out target, out args, out icon))
                 throw new InvalidOperationException("Could not resolve shortcut target.");
-            ShowProperties(target);
+
+            string scriptPath;
+            if (TryGetPowerShellScriptPath(target, args, out scriptPath) &&
+                File.Exists(scriptPath))
+            {
+                ShowProperties(scriptPath);
+            }
+            else
+            {
+                ShowProperties(target);
+            }
         }
         catch (Exception ex) { Error("Could not open target properties.", ex); }
     }
 
     private static void ShowProperties(string path)
     {
-        if (!File.Exists(path) && !Directory.Exists(path)) return;
+        if (!File.Exists(path) && !Directory.Exists(path))
+            throw new FileNotFoundException("The item no longer exists.", path);
 
-        var sei = new SHELLEXECUTEINFO();
-        sei.cbSize = Marshal.SizeOf(sei);
-        sei.fMask = SEE_MASK_INVOKEIDLIST;
-        sei.lpVerb = "properties";
-        sei.lpFile = path;
-        sei.nShow = SW_SHOW;
+        PerfLog("Starting Link Properties worker: " + path);
 
-        if (!ShellExecuteEx(ref sei))
-            throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+        Process.Start(new ProcessStartInfo
+        {
+            FileName = ExePath,
+            Arguments = "--link-properties-worker " + Quote(path),
+            WorkingDirectory = AppRoot,
+            UseShellExecute = false,
+            CreateNoWindow = true
+        });
+    }
 
-        CloseMenu(false);
+    private static void RunLinkPropertiesWorker(string path)
+    {
+        if (!File.Exists(path) && !Directory.Exists(path))
+            return;
+
+        using (var owner = new Form
+        {
+            ShowInTaskbar = false,
+            FormBorderStyle = FormBorderStyle.None,
+            StartPosition = FormStartPosition.Manual,
+            Location = new Point(-32000, -32000),
+            Size = new Size(1, 1),
+            Opacity = 0
+        })
+        {
+            bool propertyWindowSeen = false;
+            System.Windows.Forms.Timer lifetimeTimer = new System.Windows.Forms.Timer { Interval = 100 };
+
+            lifetimeTimer.Tick += delegate
+            {
+                bool propertyWindowExists = HasVisibleTopLevelWindowForCurrentProcess(owner.Handle);
+
+                if (propertyWindowExists)
+                {
+                    propertyWindowSeen = true;
+                    return;
+                }
+
+                // SHObjectProperties creates a modeless property sheet. Do not
+                // close the hidden owner merely because SHObjectProperties()
+                // returned; that destroys the property sheet before Windows has
+                // a chance to paint it. Once we have actually observed the sheet
+                // and it later disappears, the worker can exit.
+                if (propertyWindowSeen)
+                {
+                    lifetimeTimer.Stop();
+                    owner.Close();
+                }
+            };
+
+            owner.Shown += delegate
+            {
+                owner.BeginInvoke((MethodInvoker)delegate
+                {
+                    bool opened = SHObjectProperties(owner.Handle, SHOP_FILEPATH, path, null);
+                    if (!opened)
+                    {
+                        int error = Marshal.GetLastWin32Error();
+                        MessageBox.Show(
+                            "Windows could not open Link Properties.\r\n\r\nWin32 error: " + error,
+                            "Taskbar Groups",
+                            MessageBoxButtons.OK,
+                            MessageBoxIcon.Error);
+                        owner.Close();
+                        return;
+                    }
+
+                    // Keep this process/message loop alive while the native
+                    // modeless Properties sheet exists.
+                    lifetimeTimer.Start();
+                });
+            };
+
+            Application.Run(owner);
+            lifetimeTimer.Dispose();
+        }
+    }
+
+    private static bool HasVisibleTopLevelWindowForCurrentProcess(IntPtr excludedHandle)
+    {
+        bool found = false;
+        uint currentPid = (uint)Process.GetCurrentProcess().Id;
+
+        EnumWindows(delegate(IntPtr hwnd, IntPtr lParam)
+        {
+            if (hwnd == excludedHandle || !IsWindowVisible(hwnd))
+                return true;
+
+            uint pid;
+            GetWindowThreadProcessId(hwnd, out pid);
+            if (pid == currentPid)
+            {
+                found = true;
+                return false;
+            }
+
+            return true;
+        }, IntPtr.Zero);
+
+        return found;
+    }
+
+    private static void PerfLogOncePerMenuPaint()
+    {
+        if (PerfFirstMenuPaintLogged)
+            return;
+
+        PerfFirstMenuPaintLogged = true;
+        PerfLog("ContextMenuStrip first Paint event");
+
+        ScheduleDeferredMenuDisposal();
+    }
+
+    private static void ScheduleDeferredMenuDisposal()
+    {
+        if (DeferredDisposalScheduled || DeferredMenuDisposals.Count == 0)
+            return;
+
+        DeferredDisposalScheduled = true;
+
+        // BeginInvoke posts this work behind the current paint message, so the
+        // newly requested menu becomes visible before old ToolStripItems are
+        // torn down.
+        HostForm.BeginInvoke((MethodInvoker)delegate
+        {
+            Stopwatch disposeClock = Stopwatch.StartNew();
+            int disposed = 0;
+
+            try
+            {
+                while (DeferredMenuDisposals.Count > 0)
+                {
+                    ToolStripItem item = DeferredMenuDisposals.Dequeue();
+                    item.Dispose();
+                    disposed++;
+                }
+            }
+            finally
+            {
+                DeferredDisposalScheduled = false;
+                PerfLog(
+                    "Deferred previous-menu disposal completed: " +
+                    disposed + " top-level items in " +
+                    disposeClock.Elapsed.TotalMilliseconds.ToString("F1") +
+                    " ms");
+            }
+        });
+    }
+
+    private static string FormatLogLine(string level, string category, string message)
+    {
+        return DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss.fff") +
+            "  PID=" + Process.GetCurrentProcess().Id.ToString().PadLeft(6) +
+            "  " + level.PadRight(5) +
+            "  " + category.PadRight(11) +
+            "  " + message + Environment.NewLine;
+    }
+
+    private static void WriteSessionLog(string level, string category, string message)
+    {
+        if (!SessionLogActive) return;
+
+        try
+        {
+            lock (SessionLogLock)
+            {
+                Directory.CreateDirectory(DataRoot);
+                File.AppendAllText(SessionLogPath, FormatLogLine(level, category, message));
+            }
+        }
+        catch
+        {
+            // Logging must never affect launcher behavior.
+        }
+    }
+
+    private static void LogInfo(string message)
+    {
+        WriteSessionLog("INFO", "runtime", message);
+    }
+
+    private static void LogError(string message, Exception ex)
+    {
+        string detail = message;
+        if (ex != null)
+        {
+            detail += Environment.NewLine +
+                ex.GetType().FullName + ": " + ex.Message +
+                Environment.NewLine + ex.StackTrace;
+
+            if (ex.InnerException != null)
+            {
+                detail += Environment.NewLine + "Inner exception: " +
+                    ex.InnerException.GetType().FullName + ": " +
+                    ex.InnerException.Message +
+                    Environment.NewLine + ex.InnerException.StackTrace;
+            }
+        }
+
+        WriteSessionLog("ERROR", "runtime", detail);
+    }
+
+    private static void PerfLog(string message)
+    {
+        if (!PerfEnabled || !SessionLogActive) return;
+
+        string menuElapsed = PerfMenuClock == null
+            ? "       -"
+            : PerfMenuClock.Elapsed.TotalMilliseconds.ToString("0.0").PadLeft(8);
+
+        WriteSessionLog(
+            "PERF",
+            "performance",
+            "process=" + PerfClock.Elapsed.TotalMilliseconds.ToString("0.0").PadLeft(8) + " ms" +
+            "  menu=" + menuElapsed + " ms  " + message);
+    }
+
+    private static void StartSessionLog()
+    {
+        try
+        {
+            lock (SessionLogLock)
+            {
+                if (SessionLogActive) return;
+
+                Directory.CreateDirectory(DataRoot);
+                SessionLogActive = true;
+
+                File.AppendAllText(
+                    SessionLogPath,
+                    FormatLogLine("INFO", "startup",
+                        "Resident host logging session started") +
+                    FormatLogLine("INFO", "startup",
+                        "Executable: " + Process.GetCurrentProcess().MainModule.FileName) +
+                    FormatLogLine("INFO", "startup",
+                        "Session: " + Process.GetCurrentProcess().SessionId +
+                        "; PID: " + Process.GetCurrentProcess().Id) +
+                    FormatLogLine("INFO", "startup",
+                        "Performance logging: " + (PerfEnabled ? "enabled" : "disabled")) +
+                    FormatLogLine("INFO", "startup",
+                        "IPC mutex: " + HostMutexName) +
+                    FormatLogLine("INFO", "startup",
+                        "IPC pipe: " + HostPipeName));
+            }
+        }
+        catch
+        {
+            // Logging must never prevent the resident host from starting.
+        }
+    }
+
+    private static void InstallUnhandledExceptionLogging()
+    {
+        Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
+
+        Application.ThreadException += delegate(object sender, ThreadExceptionEventArgs e)
+        {
+            LogError("Unhandled WinForms UI-thread exception.", e.Exception);
+        };
+
+        AppDomain.CurrentDomain.UnhandledException += delegate(object sender, UnhandledExceptionEventArgs e)
+        {
+            Exception ex = e.ExceptionObject as Exception;
+            if (ex != null)
+                LogError("Unhandled AppDomain exception. IsTerminating=" + e.IsTerminating, ex);
+            else
+                WriteSessionLog("ERROR", "runtime",
+                    "Unhandled AppDomain exception object: " +
+                    Convert.ToString(e.ExceptionObject));
+        };
     }
 
     // ---------- Group management ----------
@@ -1155,6 +2314,7 @@ internal static class Program
 
                 Directory.CreateDirectory(folder);
                 Directory.CreateDirectory(PinRoot);
+        Directory.CreateDirectory(IconCacheRoot);
 
                 string icon = dialog.IconPath;
                 if (String.IsNullOrWhiteSpace(icon))
@@ -1350,6 +2510,27 @@ internal static class Program
 
     private static Image GetMenuImage(string path)
     {
+        // Menu startup must not depend on the shortcut target being responsive.
+        // Cache validity is based only on the group item itself, which lives in
+        // Taskbar-Groups' local data directory. In particular, do not stat the
+        // resolved target or icon source here: either could be on a sleeping HDD,
+        // disconnected USB device, or unavailable network share.
+        string cacheKey = GetIconCacheKey(path);
+        Image cached = TryGetCachedMenuImage(cacheKey);
+        if (cached != null) return cached;
+
+        Image image = LoadMenuImageUncached(path);
+        if (image != null)
+        {
+            CacheMenuImage(cacheKey, image);
+            return image;
+        }
+
+        return null;
+    }
+
+    private static Image LoadMenuImageUncached(string path)
+    {
         string ext = Path.GetExtension(path).ToLowerInvariant();
 
         if (ext == ".lnk")
@@ -1397,6 +2578,89 @@ internal static class Program
         }
 
         return null;
+    }
+
+    private static string GetIconCacheKey(string path)
+    {
+        try
+        {
+            FileInfo file = new FileInfo(path);
+            string identity = Path.GetFullPath(path).ToUpperInvariant() + "|" +
+                file.Length + "|" + file.LastWriteTimeUtc.Ticks;
+
+            using (SHA256 sha = SHA256.Create())
+            {
+                byte[] hash = sha.ComputeHash(Encoding.UTF8.GetBytes(identity));
+                var result = new StringBuilder(hash.Length * 2);
+                foreach (byte b in hash) result.Append(b.ToString("x2"));
+                return result.ToString();
+            }
+        }
+        catch
+        {
+            // If metadata cannot be read, use the path alone. This still gives us
+            // a stable cache entry without touching the shortcut's target.
+            using (SHA256 sha = SHA256.Create())
+            {
+                byte[] hash = sha.ComputeHash(Encoding.UTF8.GetBytes(path.ToUpperInvariant()));
+                var result = new StringBuilder(hash.Length * 2);
+                foreach (byte b in hash) result.Append(b.ToString("x2"));
+                return result.ToString();
+            }
+        }
+    }
+
+    private static Image TryGetCachedMenuImage(string cacheKey)
+    {
+        Bitmap memoryImage;
+        if (MemoryIconCache.TryGetValue(cacheKey, out memoryImage))
+        {
+            PerfIconCacheHits++;
+            return new Bitmap(memoryImage);
+        }
+
+        string cachePath = Path.Combine(IconCacheRoot, cacheKey + ".png");
+        if (!File.Exists(cachePath))
+        {
+            PerfIconCacheMisses++;
+            return null;
+        }
+
+        try
+        {
+            // Image.FromFile keeps the file locked for the lifetime of the Image.
+            // Clone it immediately so the cache remains freely replaceable.
+            using (Image diskImage = Image.FromFile(cachePath))
+            {
+                Bitmap stored = new Bitmap(diskImage);
+                MemoryIconCache[cacheKey] = stored;
+                PerfIconCacheHits++;
+                return new Bitmap(stored);
+            }
+        }
+        catch
+        {
+            PerfIconCacheMisses++;
+            try { File.Delete(cachePath); } catch { }
+            return null;
+        }
+    }
+
+    private static void CacheMenuImage(string cacheKey, Image image)
+    {
+        try
+        {
+            Bitmap stored = new Bitmap(image);
+            MemoryIconCache[cacheKey] = stored;
+
+            string cachePath = Path.Combine(IconCacheRoot, cacheKey + ".png");
+            stored.Save(cachePath, System.Drawing.Imaging.ImageFormat.Png);
+        }
+        catch
+        {
+            // Caching is an optimization only; icon loading must still succeed if
+            // the cache directory is temporarily unavailable.
+        }
     }
 
     private static Icon ExtractIcon(string file, int index)
@@ -1666,6 +2930,31 @@ internal static class Program
         }
     }
 
+    private static void InvalidateGroupMenuCache(string groupName)
+    {
+        if (String.IsNullOrWhiteSpace(groupName))
+            return;
+
+        CachedGroupMenu cached;
+        if (!GroupMenuCache.TryGetValue(groupName, out cached))
+            return;
+
+        GroupMenuCache.Remove(groupName);
+
+        if (String.Equals(AttachedCachedGroup, groupName, StringComparison.OrdinalIgnoreCase))
+        {
+            AttachedCachedGroup = null;
+            return;
+        }
+
+        if (cached != null && cached.Items != null)
+        {
+            foreach (ToolStripItem item in cached.Items)
+                DeferredMenuDisposals.Enqueue(item);
+            ScheduleDeferredMenuDisposal();
+        }
+    }
+
     private static void RefreshMenu()
     {
         // A submenu Click closes its owning ContextMenuStrip before this method
@@ -1676,20 +2965,33 @@ internal static class Program
             ExactRestorePoint = LastMainMenuLocation;
             UseExactRestorePoint = true;
         }
+        InvalidateGroupMenuCache(Group);
 
-        RefreshRequested = true;
-        CloseMenu(true);
+        if (MainMenu != null && MainMenu.Visible)
+            MainMenu.Close();
+
+        string groupToRefresh = Group;
+        Form host = HostForm;
+        if (host != null && !host.IsDisposed)
+        {
+            host.BeginInvoke((MethodInvoker)delegate
+            {
+                ShowRequestedGroup(groupToRefresh, true, ExactRestorePoint);
+            });
+        }
     }
 
     private static void CloseMenu(bool preserveRefresh)
     {
-        if (!preserveRefresh) RefreshRequested = false;
-        if (MainMenu != null) MainMenu.Close();
-        if (HostForm != null) HostForm.Close();
+        if (MainMenu != null && MainMenu.Visible) MainMenu.Close();
+
+        // HostForm intentionally remains alive. It owns the persistent WinForms
+        // message loop and the reusable ContextMenuStrip.
     }
 
     private static void Error(string message, Exception ex)
     {
+        LogError(message, ex);
         MessageBox.Show(message + "\r\n\r\n" + ex.Message, "Taskbar Groups",
             MessageBoxButtons.OK, MessageBoxIcon.Error);
     }
@@ -1783,6 +3085,75 @@ internal static class Program
 
     // ---------- Native shell ----------
 
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GetCursorPos(out POINT lpPoint);
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct RECT
+    {
+        public int Left;
+        public int Top;
+        public int Right;
+        public int Bottom;
+    }
+
+    [DllImport("user32.dll", CharSet = CharSet.Auto)]
+    private static extern IntPtr FindWindow(string lpClassName, string lpWindowName);
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
+
+    private const int WH_MOUSE_LL = 14;
+    private const int WM_LBUTTONDOWN = 0x0201;
+
+    private delegate IntPtr LowLevelMouseProc(
+        int nCode,
+        IntPtr wParam,
+        IntPtr lParam);
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct POINT
+    {
+        public int x;
+        public int y;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct MSLLHOOKSTRUCT
+    {
+        public POINT pt;
+        public uint mouseData;
+        public uint flags;
+        public uint time;
+        public UIntPtr dwExtraInfo;
+    }
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern IntPtr SetWindowsHookEx(
+        int idHook,
+        LowLevelMouseProc lpfn,
+        IntPtr hMod,
+        uint dwThreadId);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool UnhookWindowsHookEx(IntPtr hhk);
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr CallNextHookEx(
+        IntPtr hhk,
+        int nCode,
+        IntPtr wParam,
+        IntPtr lParam);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+    private static extern IntPtr GetModuleHandle(string lpModuleName);
+
+    private delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+
+    private const uint SHOP_FILEPATH = 0x00000002;
     private const uint SEE_MASK_INVOKEIDLIST = 0x0000000C;
     private const int SW_SHOW = 5;
     private const uint SHGFI_ICON = 0x000000100;
@@ -1821,6 +3192,14 @@ internal static class Program
     [DllImport("shell32.dll", CharSet = CharSet.Auto, SetLastError = true)]
     private static extern bool ShellExecuteEx(ref SHELLEXECUTEINFO lpExecInfo);
 
+    [DllImport("shell32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool SHObjectProperties(
+        IntPtr hwnd,
+        uint shopObjectType,
+        string pszObjectName,
+        string pszPropertyPage);
+
     [DllImport("shell32.dll", CharSet = CharSet.Auto)]
     private static extern IntPtr SHGetFileInfo(string pszPath, uint dwFileAttributes,
         ref SHFILEINFO psfi, uint cbFileInfo, uint uFlags);
@@ -1828,6 +3207,17 @@ internal static class Program
     [DllImport("shell32.dll", CharSet = CharSet.Auto)]
     private static extern uint ExtractIconEx(string szFileName, int nIconIndex,
         IntPtr[] phiconLarge, IntPtr[] phiconSmall, uint nIcons);
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool IsWindowVisible(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
 
     [DllImport("user32.dll", SetLastError = true)]
     private static extern bool DestroyIcon(IntPtr hIcon);

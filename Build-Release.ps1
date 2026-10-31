@@ -1,5 +1,7 @@
 ﻿param(
-    [string]$Version = '1.0.0'
+    [Parameter(Mandatory = $true, Position = 0)]
+    [ValidatePattern('^\d+\.\d+\.\d+$')]
+    [string]$Version
 )
 
 $ErrorActionPreference = 'Stop'
@@ -13,6 +15,12 @@ $Iss         = Join-Path $Root 'installer\Taskbar-Groups.iss'
 New-Item -ItemType Directory -Force -Path $ReleaseRoot | Out-Null
 
 Write-Host "Building Taskbar Groups $Version..."
+
+# A released build may already have the new persistent menu host running.
+# Stop it before replacing Taskbar-GroupMenu.exe.
+Get-Process -Name 'Taskbar-GroupMenu' -ErrorAction SilentlyContinue |
+    Stop-Process -Force -ErrorAction SilentlyContinue
+Start-Sleep -Milliseconds 150
 
 if (-not (Test-Path -LiteralPath $Source -PathType Leaf)) {
     throw "Launcher source was not found: $Source"
@@ -123,3 +131,43 @@ if ($installProcess.ExitCode -ne 0) {
 
 Write-Host ''
 Write-Host "Release installed successfully."
+
+
+# Start the exact executable produced by this build in resident-host mode.
+# Do not probe the install location: Inno Setup may install under an elevated
+# account/context, while this build output path is deterministic and is the
+# binary whose behavior we are testing.
+$builtMenuHost = $Launcher
+
+if (-not (Test-Path -LiteralPath $builtMenuHost -PathType Leaf)) {
+    throw "Built menu host was not found: $builtMenuHost"
+}
+
+# The installer or a previous test run may have left an older resident host
+# alive after the pre-build stop. Remove it immediately before starting the
+# freshly built host so the new binary owns both the mutex and pipe.
+Get-Process -Name 'Taskbar-GroupMenu' -ErrorAction SilentlyContinue |
+    Stop-Process -Force -ErrorAction SilentlyContinue
+Start-Sleep -Milliseconds 250
+
+Write-Host ''
+Write-Host "Starting resident menu host with --resident-host in the interactive user context..."
+
+# Do not pass an arbitrary executable command line to explorer.exe. Explorer treats
+# that syntax as shell navigation, which can open Documents instead of launching the
+# program. Use the shell's ShellExecute verb explicitly.
+$shell = New-Object -ComObject Shell.Application
+$shell.ShellExecute($builtMenuHost, '--resident-host', (Split-Path -Parent $builtMenuHost), 'open', 0)
+[void][System.Runtime.InteropServices.Marshal]::FinalReleaseComObject($shell)
+
+Start-Sleep -Milliseconds 2000
+
+$residentProcess = Get-Process -Name 'Taskbar-GroupMenu' -ErrorAction SilentlyContinue |
+    Sort-Object StartTime -Descending |
+    Select-Object -First 1
+
+if (-not $residentProcess) {
+    throw "Resident menu host was not found after shell startup."
+}
+
+Write-Host "Resident menu host running (PID $($residentProcess.Id)); startup prewarm has been given 2 seconds to complete."

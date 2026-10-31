@@ -1,4 +1,4 @@
-#ifndef MyAppVersion
+﻿#ifndef MyAppVersion
   #define MyAppVersion "1.0.0"
 #endif
 #ifndef OutputDir
@@ -33,6 +33,12 @@ VersionInfoProductVersion={#MyAppVersion}
 Source: "..\Taskbar-GroupMenu.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\Icon Library\*"; DestDir: "{app}\Icon Library"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "..\_templates\*"; DestDir: "{app}\_templates"; Flags: ignoreversion recursesubdirs createallsubdirs
+
+
+[Registry]
+; Start one resident menu host per interactive session at logon. The host warms
+; all group/menu/icon caches before the user clicks a taskbar group.
+Root: HKLM; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "TaskbarGroupsMenuHost"; ValueData: """{app}\{#MyAppExeName}"" --resident-host"; Flags: uninsdeletevalue
 
 [UninstallDelete]
 ; User data is intentionally not deleted. It lives under the user's
